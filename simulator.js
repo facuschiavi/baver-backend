@@ -42,9 +42,10 @@ module.exports = function(app, pool, authenticate) {
         return res.status(409).json({ error: 'Ya hay una simulación activa para este cliente' });
       }
 
-      // 1. Crear BD clonada
-      await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
-      await pool.query(`CREATE DATABASE ${SIM_DB} TEMPLATE ${SOURCE_DB}`);
+      // 1. Crear BD clonada sin bloquear por conexiones activas en producción.
+      // CREATE DATABASE ... TEMPLATE falla si la BD real tiene sesiones abiertas;
+      // pg_dump | psql permite clonar una instantánea consistente con la app online.
+      await cloneDatabase(pool);
       console.log(`[simulator] Clone DB created: ${SIM_DB}`);
 
       // 2. Spawn backend de simulación con la BD clonada
@@ -77,7 +78,7 @@ module.exports = function(app, pool, authenticate) {
         const initResponse = await callChatCompletions(GW_PORT, GW_TOKEN, GW_MODEL, [
           { role: 'system', content: SIM_SYSTEM_PROMPT },
           { role: 'user', content: 'Inicializá esta simulación. Explicá brevemente cómo vas a trabajar: que vas a mostrar datos consultados, decisiones y acciones para que el usuario pueda corregir procesos.' }
-        ], sim.session_key);
+        ], sim.session_key, 10000);
         initialReply = initResponse?.choices?.[0]?.message?.content || null;
       } catch (initErr) {
         console.error('[simulator] No se pudo inicializar sesión conversacional:', initErr.message || initErr);
@@ -456,6 +457,44 @@ async function cleanupOrphanSimulation(pool, reason) {
   console.log(`[simulator] Cleanup orphan completo (${reason})`);
 }
 
+
+function runShell(command, env = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-lc', command], {
+      env: { ...process.env, ...env },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stderr = '';
+    child.stderr.on('data', d => { stderr += d.toString(); });
+    child.on('close', code => {
+      if (code === 0) return resolve();
+      reject(new Error((stderr || `Comando falló con código ${code}`).trim()));
+    });
+    child.on('error', reject);
+  });
+}
+
+async function cloneDatabase(pool) {
+  const simUrl = `${DB_URL}/${SIM_DB}`;
+  await dropSimDatabase(pool);
+  await pool.query(`CREATE DATABASE ${quoteIdent(SIM_DB)}`);
+  const dumpCmd = `pg_dump --no-owner --no-acl ${shellQuote(DATABASE_URL)} | psql -v ON_ERROR_STOP=1 ${shellQuote(simUrl)} >/dev/null`;
+  try {
+    await runShell(dumpCmd);
+  } catch (err) {
+    await dropSimDatabase(pool).catch(() => {});
+    throw new Error(`No se pudo clonar la base por pg_dump: ${err.message}`);
+  }
+}
+
+function quoteIdent(name) {
+  return '"' + String(name).replace(/"/g, '""') + '"';
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
 async function dropSimDatabase(pool) {
   await pool.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [SIM_DB]);
   await pool.query(`DROP DATABASE IF EXISTS ${SIM_DB}`);
@@ -489,7 +528,7 @@ function waitForServer(port, timeoutMs) {
   });
 }
 
-function callChatCompletions(gwPort, gwToken, model, messages, sessionKey = null) {
+function callChatCompletions(gwPort, gwToken, model, messages, sessionKey = null, timeoutMs = 60000) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ model, messages, max_tokens: 1000 });
     const req = http.request({
@@ -513,6 +552,9 @@ function callChatCompletions(gwPort, gwToken, model, messages, sessionKey = null
           reject(new Error('Error parsing response: ' + data));
         }
       });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timeout consultando OpenClaw Gateway (${timeoutMs}ms)`));
     });
     req.on('error', reject);
     req.write(body);
