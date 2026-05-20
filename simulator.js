@@ -38,8 +38,21 @@ module.exports = function(app, pool, authenticate) {
   // ─── START ──────────────────────────────────────────────
   app.post('/api/simulator/start', authenticate, async (req, res) => {
     try {
-      if (simulations[req.user.client_id]) {
-        return res.status(409).json({ error: 'Ya hay una simulación activa para este cliente' });
+      const existingSim = simulations[req.user.client_id];
+      if (existingSim) {
+        return res.json({
+          ok: true,
+          already_active: true,
+          session_id: req.user.client_id,
+          backend_port: SIM_PORT,
+          model: GW_MODEL,
+          gateway_port: GW_PORT,
+          started_at: existingSim.started_at,
+          expires_at: existingSim.expires_at,
+          ttl_hours: Math.round(SIM_TTL_MS / 60 / 60 / 1000),
+          session_key: existingSim.session_key,
+          initial_reply: '🧪 Ya había una simulación activa. Sigo usando esa misma sesión.'
+        });
       }
 
       // 1. Crear BD clonada sin bloquear por conexiones activas en producción.
