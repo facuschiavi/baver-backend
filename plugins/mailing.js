@@ -7,7 +7,7 @@ module.exports = function(app, pool, authenticate) {
   // ─── ROLE CHECKER ────────────────────────────────────────────────
   function requireRole(...roles) {
     return (req, res, next) => {
-      if (!req.user || !roles.includes(req.user.rol)) {
+      if (!req.user || (!req.user.is_agent && !roles.includes(req.user.rol))) {
         return res.status(403).json({ error: `Permiso denegado. Roles permitidos: ${roles.join(', ')}` });
       }
       next();
@@ -125,6 +125,59 @@ module.exports = function(app, pool, authenticate) {
           <p><strong>Mínimo:</strong> {{min_stock}} unidades</p>
           <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
           <p style="color: #666; font-size: 12px;">VIB3 Demo - Auto Alert</p>
+        </div>`,
+    },
+    'recibo-cobro-baver': {
+      subject: '🧾 Recibo de pago - Baver Indumentaria Deportiva',
+      body: (d) => `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #f9f9f9; padding: 20px;">
+          <div style="background-color: #1a1a2e; color: white; padding: 20px; border-radius: 8px 8px 0 0; text-align: center;">
+            <h1 style="margin: 0; font-size: 24px;">Baver</h1>
+            <p style="margin: 5px 0 0; opacity: 0.8;">Indumentaria Deportiva</p>
+          </div>
+          <div style="background-color: white; padding: 20px; border-radius: 0 0 8px 8px;">
+            <h2 style="color: #1a1a2e; margin-top: 0;">🧾 Recibo de Cobro</h2>
+            <p style="color: #666;">Hola <strong>{{cliente_nombre}}</strong>, te confirmamos que recibimos tu pago.</p>
+
+            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; color: #666;">Comprobante</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">#{{recibo_numero}}</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; color: #666;">Nota de Venta</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">NV #{{nv_numero}}</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; color: #666;">Fecha de pago</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">{{fecha_pago}}</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; color: #666;">Monto pagado</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold; color: #27ae60; font-size: 18px;">${{monto_pagado}}</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; color: #666;">Método de pago</td>
+                <td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">{{metodo_pago}}</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; color: #666;">Saldo pendiente NV</td>
+                <td style="padding: 8px; font-weight: bold; color: {{#if saldo_pendiente}}#e74c3c{{else}}#27ae60{{/if}};">{{saldo_pendiente_label}}</td>
+              </tr>
+            </table>
+
+            {{#if observaciones}}
+            <div style="background-color: #fef9e7; padding: 12px; border-radius: 4px; margin: 15px 0; border-left: 4px solid #f39c12;">
+              <p style="margin: 0; color: #856404; font-size: 13px;"><strong>Observaciones:</strong> {{observaciones}}</p>
+            </div>
+            {{/if}}
+
+            <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+            <p style="color: #666; font-size: 12px; text-align: center;">
+              Baver Indumentaria Deportiva<br>
+              Ante cualquier duda respondé a este correo o contactanos por WhatsApp.
+            </p>
+          </div>
         </div>`,
     },
   };
