@@ -531,7 +531,7 @@ app.put('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
 // ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/users', authenticate, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, client_id, username, name, email, phone, telegram_id, rol, is_active, created_at FROM users WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
+    const result = await pool.query('SELECT id, client_id, username, name, email, phone, telegram_id, rol, is_active, can_escalate, created_at FROM users WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -540,12 +540,12 @@ app.get('/api/users', authenticate, async (req, res) => {
 
 app.post('/api/users', authenticate, async (req, res) => {
   try {
-    const { username, password, name, email, phone, telegram_id, rol } = req.body;
+    const { username, password, name, email, phone, telegram_id, rol, can_escalate } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Usuario y contraseña requeridos' });
     const password_hash = bcrypt.hashSync(password, 10);
     const result = await pool.query(
-      'INSERT INTO users (client_id, username, password_hash, name, email, phone, telegram_id, rol) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active',
-      [req.user.client_id, username, password_hash, name, email, phone, telegram_id || null, rol || 'operator']
+      'INSERT INTO users (client_id, username, password_hash, name, email, phone, telegram_id, rol, can_escalate) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active, can_escalate',
+      [req.user.client_id, username, password_hash, name, email, phone, telegram_id || null, rol || 'operator', can_escalate || false]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -556,15 +556,15 @@ app.post('/api/users', authenticate, async (req, res) => {
 
 app.put('/api/users/:id', authenticate, async (req, res) => {
   try {
-    const { name, email, phone, telegram_id, rol, is_active, password } = req.body;
+    const { name, email, phone, telegram_id, rol, is_active, can_escalate, password } = req.body;
     let query, params;
     if (password) {
       const password_hash = bcrypt.hashSync(password, 10);
-      query = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), telegram_id=COALESCE($4,telegram_id), rol=COALESCE($5,rol), is_active=COALESCE($6,is_active), password_hash=$7, updated_at=NOW() WHERE id=$8 AND client_id=$9 RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active';
-      params = [name, email, phone, telegram_id, rol, is_active, password_hash, req.params.id, req.user.client_id];
+      query = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), telegram_id=COALESCE($4,telegram_id), rol=COALESCE($5,rol), is_active=COALESCE($6,is_active), can_escalate=COALESCE($7,can_escalate), password_hash=$8, updated_at=NOW() WHERE id=$9 AND client_id=$10 RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active, can_escalate';
+      params = [name, email, phone, telegram_id, rol, is_active, can_escalate, password_hash, req.params.id, req.user.client_id];
     } else {
-      query = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), telegram_id=COALESCE($4,telegram_id), rol=COALESCE($5,rol), is_active=COALESCE($6,is_active), updated_at=NOW() WHERE id=$7 AND client_id=$8 RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active';
-      params = [name, email, phone, telegram_id, rol, is_active, req.params.id, req.user.client_id];
+      query = 'UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), telegram_id=COALESCE($4,telegram_id), rol=COALESCE($5,rol), is_active=COALESCE($6,is_active), can_escalate=COALESCE($7,can_escalate), updated_at=NOW() WHERE id=$8 AND client_id=$9 RETURNING id, client_id, username, name, email, phone, telegram_id, rol, is_active, can_escalate';
+      params = [name, email, phone, telegram_id, rol, is_active, can_escalate, req.params.id, req.user.client_id];
     }
     const result = await pool.query(query, params);
     res.json(result.rows[0] || null);
