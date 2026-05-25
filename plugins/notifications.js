@@ -46,9 +46,15 @@ function renderCustomTemplate(template, data) {
   };
 }
 
-function sampleTemplateData() {
+function sampleTemplateData(branding = {}) {
   return {
-    business_name: 'Demo Retail', address: 'Direccion comercial', phone: '0264 000000',
+    business_name: branding.business_name || branding.name || 'Tu negocio',
+    address: branding.address || 'Direccion comercial',
+    phone: branding.phone || branding.whatsapp || '0264 000000',
+    business_email: branding.business_email || branding.email || '',
+    whatsapp: branding.whatsapp || '',
+    fiscal_name: branding.fiscal_name || branding.name || branding.business_name || 'Tu negocio',
+    fiscal_cuit: branding.fiscal_cuit || '',
     order_number: 'NV-000123', total: '$125.000,00', created_at: new Date().toISOString(),
     invoice_number: '0001-00001234', invoice_type: 'Factura B', cae: '12345678901234',
     product_name: 'Producto demo', stock: '3', min_stock: '5',
@@ -57,6 +63,15 @@ function sampleTemplateData() {
     cash_in: '$380.000,00', cash_out: '$75.000,00', cash_balance: '$305.000,00',
     low_stock_count: 3, work_orders_count: 5, pending_orders_count: 7,
   };
+}
+
+async function previewTemplateData(pool, clientId, bodyData = {}) {
+  const client = await pool.query(
+    'SELECT name, email, phone, address, whatsapp FROM clients WHERE id=$1',
+    [clientId]
+  );
+  const branding = client.rows[0] || {};
+  return { ...sampleTemplateData(branding), ...bodyData };
 }
 
 
@@ -356,10 +371,10 @@ async function sendNotificationMail(poolRef, clientId, eventType, payload) {
   const branding = client.rows[0];
   const from = process.env.MAIL_FROM || 'VIB3 <noreply@demo.vib3.ar>';
   const settings = await p.query(
-    'SELECT ns.email_enabled, ns.notify_roles, ns.template_id, nt.name AS custom_template_name, nt.subject, nt.html_body, nt.text_body FROM notification_settings ns LEFT JOIN notification_templates nt ON nt.id=ns.template_id AND (nt.client_id=ns.client_id OR nt.client_id IS NULL) WHERE ns.client_id=$1 AND ns.event_type=$2',
+    'SELECT ns.email_enabled, ns.whatsapp_enabled, ns.notify_roles, ns.template_id, nt.name AS custom_template_name, nt.subject, nt.html_body, nt.text_body, nt.whatsapp_body FROM notification_settings ns LEFT JOIN notification_templates nt ON nt.id=ns.template_id AND (nt.client_id=ns.client_id OR nt.client_id IS NULL) WHERE ns.client_id=$1 AND ns.event_type=$2',
     [clientId, eventType]
   );
-  if (settings.rows.length === 0 || !settings.rows[0].email_enabled) return { skipped: true };
+  if (settings.rows.length === 0 || (!settings.rows[0].email_enabled && !settings.rows[0].whatsapp_enabled)) return { skipped: true };
   const notifyRoles = settings.rows[0].notify_roles || [];
   let recipients = [];
 
@@ -380,7 +395,7 @@ async function sendNotificationMail(poolRef, clientId, eventType, payload) {
     const contactEmail = payload.contact_email || payload.email || null;
     if (contactEmail && !recipients.includes(contactEmail)) recipients.push(contactEmail);
   }
-  if (recipients.length === 0) return { skipped: 'no recipients' };
+  
 
   let emailData = { ...branding, ...payload };
   emailData = await resolveCustomVariables(p, clientId, eventType, emailData, payload);
@@ -395,9 +410,49 @@ async function sendNotificationMail(poolRef, clientId, eventType, payload) {
     if (!templateFn) return { error: `template ${templateName} not found` };
     ({ subject, html } = templateFn(emailData));
   }
-  const { data, error } = await resend.emails.send({ from, to: recipients, subject, html });
-  if (error) { console.error(`[notification] mail error for ${eventType}:`, error); return { error: error.message }; }
-  return { success: true, id: data.id, recipients };
+  let data = null;
+  let error = null;
+  if (settings.rows[0].email_enabled) {
+    if (recipients.length === 0) {
+      console.log(`[notification] mail skipped for ${eventType}: no recipients`);
+    } else {
+      ({ data, error } = await resend.emails.send({ from, to: recipients, subject, html }));
+      if (error) { console.error(`[notification] mail error for ${eventType}:`, error); }
+    }
+  }
+
+  // Enviar por WhatsApp si esta habilitado
+  if (settings.rows[0].whatsapp_enabled) {
+    try {
+      const rawText = settings.rows[0].whatsapp_body || settings.rows[0].text_body || html.replace(/<[^>]*>/g, '').substring(0, 1000);
+      const renderedText = renderTextTemplate(rawText, emailData);
+      let contactPhone = null;
+
+      // Buscar telefono de usuarios segun su rol (como se busca el email)
+      const rolePhones = notifyRoles.filter(r => r !== 'cliente');
+      if (rolePhones.length > 0) {
+        const users = await p.query(
+          "SELECT phone FROM users WHERE client_id=$1 AND deleted_at IS NULL AND phone IS NOT NULL AND phone != '' AND rol = ANY($2)",
+          [clientId, rolePhones]
+        );
+        if (users.rows.length > 0) contactPhone = users.rows[0].phone;
+      } else if (notifyRoles.includes('cliente')) {
+        if (payload.contact_phone) contactPhone = payload.contact_phone;
+        else if (payload.phone) contactPhone = payload.phone;
+      }
+
+      if (contactPhone) {
+        const { sendWhatsApp } = require('./openwa');
+        await sendWhatsApp(contactPhone, renderedText, eventType);
+        console.log(`[notification] WhatsApp sent for ${eventType} to ${contactPhone}`);
+      }
+    } catch (e) {
+      console.error(`[notification] WhatsApp error for ${eventType}:`, e.message);
+    }
+  }
+
+  if (error) return { error: error.message };
+  return { success: true, id: data ? data.id : null, recipients };
 }
 
 // ─── CRON SCHEDULER ───────────────────────────────────────────────
@@ -407,7 +462,7 @@ async function processCronJobs(poolRef) {
   const tz = 'America/Argentina/San_Juan';
   try {
     const jobs = await p.query(
-      `SELECT cj.*, ce.template_name, ce.description, nt.name AS custom_template_name, nt.subject, nt.html_body, nt.text_body FROM cron_jobs cj
+      `SELECT cj.*, ce.template_name, ce.description, nt.name AS custom_template_name, nt.subject, nt.html_body, nt.text_body, nt.whatsapp_body FROM cron_jobs cj
         JOIN cron_events ce ON ce.event_type = cj.event_type LEFT JOIN notification_templates nt ON nt.id=cj.template_id AND (nt.client_id=cj.client_id OR nt.client_id IS NULL) WHERE cj.enabled = true`
     );
     for (const job of jobs.rows) {
@@ -610,7 +665,7 @@ function setupNotificationRoutes(app, pool, authenticate) {
   app.get('/api/notifications/templates', authenticate, async (req, res) => {
     try {
       const templates = await pool.query(
-        `SELECT * FROM notification_templates WHERE channel='email' AND is_active=true AND (client_id=$1 OR client_id IS NULL) ORDER BY is_system DESC, name ASC`,
+        `SELECT * FROM notification_templates WHERE channel='email' AND is_active=true AND (client_id=$1 OR client_id IS NULL) ORDER BY (client_id IS NOT NULL) DESC, is_system ASC, name ASC`,
         [req.user.client_id]
       );
       res.json({ templates: templates.rows });
@@ -619,12 +674,12 @@ function setupNotificationRoutes(app, pool, authenticate) {
 
   app.post('/api/notifications/templates', authenticate, async (req, res) => {
     try {
-      const { name, subject, html_body, text_body, variables_schema } = req.body;
-      if (!name || !html_body) return res.status(400).json({ error: 'name y html_body son obligatorios' });
+      const { name, subject, html_body, text_body, whatsapp_body, variables_schema } = req.body;
+      if (!name || (!html_body && !whatsapp_body)) return res.status(400).json({ error: 'name y al menos un cuerpo son obligatorios' });
       const result = await pool.query(
-        `INSERT INTO notification_templates (client_id, name, channel, subject, html_body, text_body, variables_schema, is_system)
-         VALUES ($1,$2,'email',$3,$4,$5,$6,false) RETURNING *`,
-        [req.user.client_id, name, subject || '', sanitizeTemplateHtml(html_body), text_body || '', JSON.stringify(variables_schema || {})]
+        `INSERT INTO notification_templates (client_id, name, channel, subject, html_body, text_body, whatsapp_body, variables_schema, is_system)
+         VALUES ($1,$2,'email',$3,$4,$5,$6,$7,false) RETURNING *`,
+        [req.user.client_id, name, subject || '', sanitizeTemplateHtml(html_body || '<p></p>'), text_body || '', whatsapp_body || null, JSON.stringify(variables_schema || {})]
       );
       res.status(201).json({ template: result.rows[0] });
     } catch (err) { res.status(500).json({ error: err.message }); }
@@ -632,13 +687,13 @@ function setupNotificationRoutes(app, pool, authenticate) {
 
   app.put('/api/notifications/templates/:id', authenticate, async (req, res) => {
     try {
-      const { name, subject, html_body, text_body, variables_schema, is_active } = req.body;
+      const { name, subject, html_body, text_body, whatsapp_body, variables_schema, is_active } = req.body;
       const result = await pool.query(
         `UPDATE notification_templates SET
            name=COALESCE($1,name), subject=COALESCE($2,subject), html_body=COALESCE($3,html_body),
-           text_body=COALESCE($4,text_body), variables_schema=COALESCE($5,variables_schema), is_active=COALESCE($6,is_active), updated_at=NOW()
-         WHERE id=$7 AND client_id=$8 AND is_system=false RETURNING *`,
-        [name, subject, html_body ? sanitizeTemplateHtml(html_body) : null, text_body, variables_schema ? JSON.stringify(variables_schema) : null, is_active, req.params.id, req.user.client_id]
+           text_body=COALESCE($4,text_body), whatsapp_body=COALESCE($5,whatsapp_body), variables_schema=COALESCE($6,variables_schema), is_active=COALESCE($7,is_active), updated_at=NOW()
+         WHERE id=$8 AND client_id=$9 AND is_system=false RETURNING *`,
+        [name, subject, html_body ? sanitizeTemplateHtml(html_body) : null, text_body, whatsapp_body || null, variables_schema ? JSON.stringify(variables_schema) : null, is_active, req.params.id, req.user.client_id]
       );
       if (result.rows.length === 0) return res.status(404).json({ error: 'No encontrado o template de sistema' });
       res.json({ template: result.rows[0] });
@@ -660,7 +715,9 @@ function setupNotificationRoutes(app, pool, authenticate) {
     try {
       const tpl = await pool.query(`SELECT * FROM notification_templates WHERE id=$1 AND (client_id=$2 OR client_id IS NULL)`, [req.params.id, req.user.client_id]);
       if (!tpl.rows[0]) return res.status(404).json({ error: 'No encontrado' });
-      const rendered = renderCustomTemplate(tpl.rows[0], { ...sampleTemplateData(), ...(req.body?.data || {}) });
+      const data = await previewTemplateData(pool, req.user.client_id, req.body?.data || {});
+      const rendered = renderCustomTemplate(tpl.rows[0], data);
+      rendered.whatsapp = renderTextTemplate(tpl.rows[0].whatsapp_body || tpl.rows[0].text_body || rendered.html.replace(/<[^>]*>/g, ''), data);
       res.json({ preview: rendered });
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
@@ -671,7 +728,7 @@ function setupNotificationRoutes(app, pool, authenticate) {
       if (!tpl.rows[0]) return res.status(404).json({ error: 'No encontrado' });
       const to = req.body?.to || (await pool.query("SELECT email FROM users WHERE id=$1 AND client_id=$2", [req.user.id, req.user.client_id])).rows[0]?.email;
       if (!to) return res.status(400).json({ error: 'No hay email destino' });
-      const rendered = renderCustomTemplate(tpl.rows[0], { ...sampleTemplateData(), ...(req.body?.data || {}) });
+      const rendered = renderCustomTemplate(tpl.rows[0], await previewTemplateData(pool, req.user.client_id, req.body?.data || {}));
       const from = process.env.MAIL_FROM || 'VIB3 <noreply@demo.vib3.ar>';
       const { data, error } = await resend.emails.send({ from, to, subject: rendered.subject, html: rendered.html });
       if (error) return res.status(500).json({ error: error.message });
@@ -679,6 +736,44 @@ function setupNotificationRoutes(app, pool, authenticate) {
     } catch (err) { res.status(500).json({ error: err.message }); }
   });
 
+  app.post('/api/notifications/templates/:id/test-whatsapp', authenticate, async (req, res) => {
+    try {
+      const tpl = await pool.query(`SELECT * FROM notification_templates WHERE id=$1 AND (client_id=$2 OR client_id IS NULL)`, [req.params.id, req.user.client_id]);
+      if (!tpl.rows[0]) return res.status(404).json({ error: 'No encontrado' });
+      const to = req.body?.to || (await pool.query("SELECT phone FROM users WHERE id=$1 AND client_id=$2", [req.user.id, req.user.client_id])).rows[0]?.phone;
+      if (!to) return res.status(400).json({ error: 'No hay telefono destino' });
+      const data = await previewTemplateData(pool, req.user.client_id, req.body?.data || {});
+      const rendered = renderCustomTemplate(tpl.rows[0], data);
+      const text = renderTextTemplate(tpl.rows[0].whatsapp_body || tpl.rows[0].text_body || rendered.html.replace(/<[^>]*>/g, ''), data);
+      const { sendWhatsApp } = require('./openwa');
+      const result = await sendWhatsApp(to, text, 'template-test');
+      res.json({ ok: true, result });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+
+  // --- TEST WHATSAPP ---
+  app.post('/api/notifications/test-whatsapp', authenticate, async (req, res) => {
+    try {
+      const { to, text } = req.body;
+      const dest = to || '5492644367457';
+      const msg = text || 'Prueba desde dashboard VIB3 - WhatsApp funcionando!';
+      const { sendWhatsApp } = require('./openwa');
+      const result = await sendWhatsApp(dest, msg, 'test');
+      res.json({ ok: true, result });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+  });
+
+}
+
+
+// ─── RENDER TEXT (plain text variables) ────────────────────────
+function renderTextTemplate(template, data) {
+  let text = template || '';
+  for (const [key, val] of Object.entries(data)) {
+    text = text.replace(new RegExp('{{' + key + '}}', 'g'), val || '');
+  }
+  return text;
 }
 
 module.exports = {

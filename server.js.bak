@@ -11,7 +11,14 @@ const fs = require('fs');
 const { OpenAI, toFile } = require('openai');
 const app = express();
 const PORT = process.env.PORT || 4000;
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let openai = null;
+try {
+  if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'sk-demo-placeholder') {
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  }
+} catch (e) {
+  console.warn('OpenAI no disponible:', e.message);
+}
 const JWT_SECRET = process.env.JWT_SECRET || 'vib3ia-secret-key-change-in-production';
 
 const pool = new Pool({
@@ -21,14 +28,56 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
+
+
+async function getIvaAlicuotas(activeOnly = true) {
+  const where = activeOnly ? 'WHERE is_active = true' : '';
+  const { rows } = await pool.query(`SELECT codigo_afip, porcentaje, nombre, descripcion, is_active FROM iva_alicuotas ${where} ORDER BY sort_order, porcentaje`);
+  return rows;
+}
+
+function normalizeAlicuotaValue(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return NaN;
+  return Math.round(n * 100) / 100;
+}
+
+async function validateIvaAlicuota(value, { allowNull = false } = {}) {
+  const normalized = normalizeAlicuotaValue(value);
+  if (normalized === null && allowNull) return null;
+  if (normalized === null) return 21;
+  if (Number.isNaN(normalized)) {
+    const err = new Error('Alícuota IVA inválida');
+    err.statusCode = 400;
+    throw err;
+  }
+  const result = await pool.query('SELECT porcentaje FROM iva_alicuotas WHERE is_active = true AND porcentaje = $1', [normalized]);
+  if (result.rows.length === 0) {
+    const err = new Error('Alícuota IVA no permitida. Usá una alícuota parametrizada.');
+    err.statusCode = 400;
+    throw err;
+  }
+  return normalized;
+}
+
+async function getNextOrderNumber(db, clientId) {
+  const { rows } = await db.query(
+    `SELECT COALESCE(MAX(CAST(SUBSTRING(order_number FROM 4) AS INTEGER)), 0) + 1 AS next_num
+     FROM orders
+     WHERE client_id = $1 AND order_number ~ '^NV-[0-9]+$'`,
+    [clientId]
+  );
+  return 'NV-' + String(Number(rows[0].next_num || 1)).padStart(5, '0');
+}
+
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }))
 app.use(function(err,req,res,next){if(err instanceof SyntaxError){console.error('JSON parse error');res.status(400).json({error:'Invalid JSON'});}next(err);});
 
-// ─── GLOBAL MIDDLEWARE: Agent API Key (runs before every request) ──
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.use(agentAuth);
 
-// ─── MIDDLEWARE: Agent API Key Auth ──────────────────────────────
 async function agentAuth(req, res, next) {
   const agentKey = req.headers['x-agent-key'];
   if (!agentKey) return next(); // No agent key, continue to JWT auth
@@ -51,7 +100,7 @@ async function agentAuth(req, res, next) {
   }
 }
 
-// ─── MIDDLEWARE: Auth (JWT) ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function authenticate(req, res, next) {
   // Already authenticated via agent API key?
   if (req.user && req.user.is_agent) return next();
@@ -68,6 +117,96 @@ async function authenticate(req, res, next) {
   } catch {
     res.status(401).json({ error: 'Token inválido' });
   }
+}
+
+
+const MODULE_DEFINITIONS = {
+  base: {
+    label: 'Base + CRM',
+    routes: [
+      /^\/api\/(auth\/me|clients|users|agents|agent-capabilities|agent-instructions|agent-procedures|contacts|lead-sources|leads|dashboard|order-statuses|payment-statuses|condiciones-iva|iva-alicuotas|fiscal-data)/,
+    ],
+  },
+  retail: {
+    label: 'Retail',
+    routes: [
+      /^\/api\/(products|product-categories|product-brands|services|orders|sale-channels|payment-methods|cash|cash-sessions|cash-movements|providers|purchase-orders|purchase-statuses|payment-sessions|payment-movements|expenses|expense-categories|advances|client-advances|deliveries|afip)/,
+    ],
+  },
+  subscriptions: {
+    label: 'Suscripciones',
+    dependsOn: ['retail'],
+    routes: [/^\/api\/(plans|subscriptions|billing-cycles)/],
+  },
+  workshop: {
+    label: 'Taller',
+    dependsOn: ['retail'],
+    routes: [/^\/api\/(design-requests|production|fabricacion|input-items)/],
+  },
+  budgets: {
+    label: 'Presupuestos',
+    dependsOn: ['retail'],
+    routes: [/^\/api\/(budgets|presupuestos)/],
+  },
+  integrations: {
+    label: 'Integraciones',
+    routes: [/^\/api\/(integrations|shopify|plugins)/],
+  },
+};
+
+const MODULE_KEYS = Object.keys(MODULE_DEFINITIONS);
+const PUBLIC_API_ROUTES = [
+  /^\/api\/health$/,
+  /^\/api\/auth\/login$/,
+  /^\/api\/condiciones-iva$/,
+  /^\/api\/design-requests\/public\//,
+];
+
+function getRouteModule(path) {
+  for (const [key, definition] of Object.entries(MODULE_DEFINITIONS)) {
+    if (definition.routes.some((regex) => regex.test(path))) return key;
+  }
+  return null;
+}
+
+async function getClientModules(clientId) {
+  const result = await pool.query(
+    'SELECT module_key, enabled FROM client_modules WHERE client_id = $1',
+    [clientId]
+  );
+  const modules = Object.fromEntries(MODULE_KEYS.map((key) => [key, true]));
+  for (const row of result.rows) {
+    if (MODULE_KEYS.includes(row.module_key)) modules[row.module_key] = row.enabled;
+  }
+  return modules;
+}
+
+function moduleIsEnabled(modules, moduleKey) {
+  if (!moduleKey || moduleKey === 'base') return true;
+  const definition = MODULE_DEFINITIONS[moduleKey];
+  if (!definition) return true;
+  if (modules[moduleKey] === false) return false;
+  return (definition.dependsOn || []).every((dep) => moduleIsEnabled(modules, dep));
+}
+
+async function moduleGate(req, res, next) {
+  if (!req.path.startsWith('/api')) return next();
+  if (PUBLIC_API_ROUTES.some((regex) => regex.test(req.path))) return next();
+
+  authenticate(req, res, async () => {
+    try {
+      if (req.path === '/api/client-modules') return next();
+      const moduleKey = getRouteModule(req.path);
+      if (!moduleKey) return next();
+      const modules = await getClientModules(req.user.client_id);
+      if (!moduleIsEnabled(modules, moduleKey)) {
+        return res.status(403).json({ error: 'Módulo no habilitado', module: moduleKey });
+      }
+      next();
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
 }
 
 function effectiveCashUserId(req) {
@@ -106,7 +245,7 @@ function parseJsonOrNull(value) {
 }
 
 
-// ─── HELPER: getProductStockConfig ────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function getProductStockConfig(clientId, productId) {
   const { rows } = await pool.query(
     'SELECT at.id as attribute_type_id, at.name as attribute_type_name, av.id as attribute_value_id, av.value as attribute_value_name, pa.stock_quantity ' +
@@ -136,7 +275,7 @@ async function getProductStockConfig(clientId, productId) {
   return { hasAttributes: true, has_attributes: true, requires_stock: true, attributeTypes: Object.values(attributeTypes) };
 }
 
-// ─── HELPER: adjustInventoryStock ────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 async function adjustInventoryStock(client, params) {
   const { productId, attributeValueId, quantity, increase = true } = params;
   const qty = Number(quantity || 0);
@@ -156,7 +295,35 @@ async function adjustInventoryStock(client, params) {
   }
 }
 
-// ─── HEALTH ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
+async function recalculateOrderOperationalStatus(client, orderId, clientId) {
+  const { rows: items } = await client.query(
+    "SELECT fulfillment_status FROM order_items WHERE order_id = $1 AND deleted_at IS NULL",
+    [orderId]
+  );
+  if (!items.length) return;
+
+  const deliveredCount = items.filter(i => i.fulfillment_status === 'delivered').length;
+  let targetNames;
+  if (deliveredCount === items.length) {
+    targetNames = ['entregado', 'realizado', 'completado'];
+  } else if (deliveredCount > 0) {
+    targetNames = ['parcial'];
+  } else {
+    targetNames = ['pendiente', 'pedido'];
+  }
+
+  const { rows: statusRows } = await client.query(
+    "SELECT id, LOWER(name) AS lname FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL ORDER BY sort_order, id",
+    [clientId]
+  );
+  const found = statusRows.find(s => targetNames.includes(s.lname)) || statusRows[0];
+  if (found) {
+    await client.query('UPDATE orders SET order_status_id = $1, updated_at = NOW() WHERE id = $2 AND client_id = $3', [found.id, orderId, clientId]);
+  }
+}
+
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -166,7 +333,7 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// ─── AUTH ──────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -182,13 +349,13 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const user = result.rows[0];
-    const validPassword = bcrypt.compareSync(password, user.password_hash) 
-      || user.password_hash === bcrypt.hashSync(password, 'salt').slice(0, -28); // legacy MD5 compat
-
-    // Direct MD5 check for existing users (backward compat)
     const crypto = require('crypto');
     const md5 = crypto.createHash('md5').update(password).digest('hex');
-    if (user.password_hash !== md5 && !bcrypt.compareSync(password, user.password_hash)) {
+    let passwordOk = user.password_hash === md5;
+    if (!passwordOk && /^\$2[aby]\$/.test(user.password_hash || '')) {
+      passwordOk = bcrypt.compareSync(password, user.password_hash);
+    }
+    if (!passwordOk) {
       return res.status(401).json({ error: 'Usuario o contraseña incorrecta' });
     }
 
@@ -220,7 +387,57 @@ app.get('/api/auth/me', authenticate, async (req, res) => {
   }
 });
 
-// ─── CLIENTS ───────────────────────────────────────────────────────
+
+app.get('/api/client-modules', authenticate, async (req, res) => {
+  try {
+    const modules = await getClientModules(req.user.client_id);
+    res.json({
+      modules,
+      definitions: Object.fromEntries(Object.entries(MODULE_DEFINITIONS).map(([key, value]) => [key, { label: value.label, dependsOn: value.dependsOn || [] }]))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/client-modules', authenticate, async (req, res) => {
+  try {
+    const requested = req.body?.modules || {};
+    const modules = Object.fromEntries(MODULE_KEYS.map((key) => [key, requested[key] !== false]));
+    modules.base = true;
+
+    if (modules.retail === false) {
+      modules.subscriptions = false;
+      modules.workshop = false;
+      modules.budgets = false;
+    }
+
+    await pool.query('BEGIN');
+    try {
+      for (const [key, enabled] of Object.entries(modules)) {
+        await pool.query(
+          `INSERT INTO client_modules (client_id, module_key, enabled, updated_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (client_id, module_key)
+           DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()`,
+          [req.user.client_id, key, enabled]
+        );
+      }
+      await pool.query('COMMIT');
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+
+    res.json({ modules: await getClientModules(req.user.client_id) });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.use(moduleGate);
+
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/clients', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM clients ORDER BY name');
@@ -269,7 +486,16 @@ app.put('/api/clients/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── FISCAL DATA ────────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
+
+app.get('/api/iva-alicuotas', authenticate, async (req, res) => {
+  try {
+    res.json(await getIvaAlicuotas(true));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM fiscal_data WHERE deleted_at IS NULL AND client_id = $1', [req.params.clientId]);
@@ -281,26 +507,28 @@ app.get('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
 
 app.put('/api/fiscal-data/:clientId', authenticate, async (req, res) => {
   try {
-    const { razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb } = req.body;
+    const { razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuota_default } = req.body;
+    const alicuotaDefault = await validateIvaAlicuota(alicuota_default || 21);
     const result = await pool.query(
-      `INSERT INTO fiscal_data (client_id, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO fiscal_data (client_id, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuota_default)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (client_id) DO UPDATE SET
          razon_social=EXCLUDED.razon_social,
          cuit=EXCLUDED.cuit,
          condicion_iva=EXCLUDED.condicion_iva,
          situacion_iibb=EXCLUDED.situacion_iibb,
-         numero_iibb=EXCLUDED.numero_iibb
+         numero_iibb=EXCLUDED.numero_iibb,
+         alicuota_default=EXCLUDED.alicuota_default
        RETURNING *`,
-      [req.params.clientId, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb]
+      [req.params.clientId, razon_social, cuit, condicion_iva, situacion_iibb, numero_iibb, alicuotaDefault]
     );
     res.json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
-// ─── USERS ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/users', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT id, client_id, username, name, email, phone, telegram_id, rol, is_active, created_at FROM users WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -354,7 +582,7 @@ app.delete('/api/users/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENTS ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agents', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM agents WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -416,7 +644,7 @@ app.delete('/api/agents/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT CAPABILITIES ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-capabilities', authenticate, async (req, res) => {
   try {
     const clientId = req.query.client_id || req.user.client_id;
@@ -435,7 +663,7 @@ app.get('/api/agent-capabilities', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT INSTRUCTIONS ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-instructions', authenticate, async (req, res) => {
   try {
     const agentId = req.query.agent_id || req.user.client_id;
@@ -490,7 +718,7 @@ app.delete('/api/agent-instructions/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── AGENT PROCEDURES ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/agent-procedures', authenticate, async (req, res) => {
   try {
     const agentId = req.query.agent_id || req.user.client_id;
@@ -523,6 +751,19 @@ app.post('/api/agent-procedures', authenticate, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// endpoint-audit: reordered agent procedures
+app.put('/api/agent-procedures/reorder', authenticate, async (req, res) => {
+  try {
+    const { orders } = req.body;
+    if (!Array.isArray(orders)) return res.status(400).json({ error: 'orders debe ser un array de { id, step_order }' });
+    for (const item of orders) {
+      if (!item.id || item.step_order === undefined) continue;
+      await pool.query('UPDATE agent_procedures SET step_order = $1, updated_at = NOW() WHERE id = $2', [item.step_order, item.id]);
+    }
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.put('/api/agent-procedures/:id', authenticate, async (req, res) => {
@@ -561,7 +802,7 @@ app.delete('/api/agent-procedures/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PAYMENT METHODS ───────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-methods', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM payment_methods WHERE deleted_at IS NULL AND client_id = $1 ORDER BY sort_order', [req.user.client_id]);
@@ -572,22 +813,39 @@ app.get('/api/payment-methods', authenticate, async (req, res) => {
 });
 
 app.post('/api/payment-methods', authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order } = req.body;
-    const result = await pool.query(
-      'INSERT INTO payment_methods (client_id, name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-      [req.user.client_id, name, is_personal || false, is_cash !== false, cbu_cvu || null, alias || null, banco || null, sort_order || 0]
+    const { name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order, generates_payment_link, integration_provider, integration_label } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
+    await client.query('BEGIN');
+    const provider = generates_payment_link ? (integration_provider || 'mercadopago') : null;
+    if (generates_payment_link && provider) {
+      await client.query('UPDATE payment_methods SET generates_payment_link = false, integration_provider = NULL, integration_label = NULL, updated_at = NOW() WHERE client_id = $1 AND integration_provider = $2 AND deleted_at IS NULL', [req.user.client_id, provider]);
+    }
+    const result = await client.query(
+      'INSERT INTO payment_methods (client_id, name, is_personal, is_cash, cbu_cvu, alias, banco, sort_order, generates_payment_link, integration_provider, integration_label) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+      [req.user.client_id, name, is_personal || false, is_cash !== false, cbu_cvu || null, alias || null, banco || null, sort_order || 0, Boolean(generates_payment_link), provider, integration_label || (provider === 'mercadopago' ? 'Mercado Pago' : provider)]
     );
+    await client.query('COMMIT');
     res.status(201).json(result.rows[0]);
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
 app.put('/api/payment-methods/:id', authenticate, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order } = req.body;
-    const result = await pool.query(
+    const { name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, generates_payment_link, integration_provider, integration_label } = req.body;
+    await client.query('BEGIN');
+    const provider = generates_payment_link ? (integration_provider || 'mercadopago') : null;
+    if (generates_payment_link && provider) {
+      await client.query('UPDATE payment_methods SET generates_payment_link = false, integration_provider = NULL, integration_label = NULL, updated_at = NOW() WHERE client_id = $1 AND integration_provider = $2 AND id <> $3 AND deleted_at IS NULL', [req.user.client_id, provider, req.params.id]);
+    }
+    const result = await client.query(
       `UPDATE payment_methods SET 
         name=COALESCE($1,name), 
         is_personal=COALESCE($2,is_personal), 
@@ -597,13 +855,20 @@ app.put('/api/payment-methods/:id', authenticate, async (req, res) => {
         banco=COALESCE($6,banco), 
         is_active=COALESCE($7,is_active), 
         sort_order=COALESCE($8,sort_order), 
+        generates_payment_link=COALESCE($9,generates_payment_link),
+        integration_provider=$10,
+        integration_label=$11,
         updated_at=NOW() 
-       WHERE id=$9 AND client_id=$10 RETURNING *`,
-      [name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, req.params.id, req.user.client_id]
+       WHERE id=$12 AND client_id=$13 RETURNING *`,
+      [name, is_personal, is_cash, cbu_cvu, alias, banco, is_active, sort_order, generates_payment_link, provider, generates_payment_link ? (integration_label || (provider === 'mercadopago' ? 'Mercado Pago' : provider)) : null, req.params.id, req.user.client_id]
     );
+    await client.query('COMMIT');
     res.json(result.rows[0] || null);
   } catch (error) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -616,7 +881,7 @@ app.delete('/api/payment-methods/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT CATEGORIES ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/product-categories', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM product_categories WHERE deleted_at IS NULL AND client_id = $1 ORDER BY sort_order', [req.user.client_id]);
@@ -629,6 +894,7 @@ app.get('/api/product-categories', authenticate, async (req, res) => {
 app.post('/api/product-categories', authenticate, async (req, res) => {
   try {
     const { name, description, sort_order, auto_generate_sku, sku_prefix } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
       'INSERT INTO product_categories (client_id, name, description, sort_order, auto_generate_sku, sku_prefix) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
       [req.user.client_id, name, description || null, sort_order || 0, auto_generate_sku !== false, sku_prefix ? sku_prefix.toUpperCase().substring(0,3) : null]
@@ -666,7 +932,7 @@ app.delete('/api/product-categories/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT BRANDS ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/product-brands', authenticate, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM product_brands WHERE deleted_at IS NULL AND client_id = $1 ORDER BY name', [req.user.client_id]);
@@ -679,6 +945,7 @@ app.get('/api/product-brands', authenticate, async (req, res) => {
 app.post('/api/product-brands', authenticate, async (req, res) => {
   try {
     const { name, is_imported, premium_level } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
       'INSERT INTO product_brands (client_id, name, is_imported, premium_level) VALUES ($1, $2, $3, $4) RETURNING *',
       [req.user.client_id, name, is_imported || false, premium_level || 5]
@@ -717,7 +984,7 @@ app.delete('/api/product-brands/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCTS ──────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products', authenticate, async (req, res) => {
   try {
     const includeDiscontinued = req.headers['x-include-discontinued'] === '1' || req.query.include_discontinued === 'true';
@@ -744,7 +1011,9 @@ app.get('/api/products', authenticate, async (req, res) => {
 
 app.post('/api/products', authenticate, async (req, res) => {
   try {
-    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url } = req.body;
+    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
+    const alicuotaProducto = await validateIvaAlicuota(alicuota, { allowNull: true });
     
     let finalSku = sku || null;
     // Auto-generate SKU if category has auto_generate_sku and no SKU provided
@@ -759,8 +1028,8 @@ app.post('/api/products', authenticate, async (req, res) => {
     }
 
     const result = await pool.query(
-      `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING *`,
+      `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
       [req.user.client_id, finalSku, sku_externo || null, name, description || null,
        commercial_description || null, category_id || null, brand_id || null,
        price || 0, unit || 'unidad',
@@ -769,20 +1038,18 @@ app.post('/api/products', authenticate, async (req, res) => {
        requires_stock || false,
        is_premium || false,
        is_premium ? (premium_level || 5) : null,
-       cost_price || 0,
-       image_url || null,
-       genera_diseno || false,
-       diseno_template_url || null, has_attributes || false]
+       cost_price || 0, image_url || null, genera_diseno || false, diseno_template_url || null, has_attributes || false, alicuotaProducto]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
 app.put('/api/products/:id', authenticate, async (req, res) => {
   try {
-    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes } = req.body;
+    const { sku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock, requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes, alicuota } = req.body;
+    const alicuotaProducto = await validateIvaAlicuota(alicuota, { allowNull: true });
 
     let finalSku = (sku && String(sku).trim()) ? String(sku).trim() : null;
     // Auto-generate SKU on edit too, if category has auto_generate_sku and SKU was left empty
@@ -804,10 +1071,12 @@ app.put('/api/products/:id', authenticate, async (req, res) => {
         unit=COALESCE($9,unit), stock_quantity=COALESCE($10,stock_quantity), min_stock=COALESCE($11,min_stock),
         requires_stock=COALESCE($12,requires_stock), is_premium=COALESCE($13,is_premium), premium_level=COALESCE($14,premium_level),
         cost_price=COALESCE($15,cost_price), is_active=COALESCE($16,is_active), image_url=NULLIF($17,''),
-        genera_diseno=COALESCE($18,genera_diseno), diseno_template_url=COALESCE($19,diseno_template_url), has_attributes=COALESCE($20,has_attributes), updated_at=NOW()
-       WHERE id=$21 AND client_id=$22 RETURNING *`,
+        genera_diseno=COALESCE($18,genera_diseno), diseno_template_url=COALESCE($19,diseno_template_url), has_attributes=COALESCE($20,has_attributes),
+        alicuota=$21, updated_at=NOW()
+       WHERE id=$22 AND client_id=$23 RETURNING *`,
       [finalSku, sku_externo, name, description, commercial_description, category_id, brand_id, price, unit, stock_quantity, min_stock,
-       requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes, req.params.id, req.user.client_id]
+       requires_stock, is_premium, premium_level, cost_price, is_active, image_url, genera_diseno, diseno_template_url, has_attributes,
+       alicuotaProducto, req.params.id, req.user.client_id]
     );
     if (result.rows[0]) {
       if (requires_stock === false) {
@@ -819,7 +1088,7 @@ app.put('/api/products/:id', authenticate, async (req, res) => {
     }
     res.json(result.rows[0] || null);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ error: error.message });
   }
 });
 
@@ -832,7 +1101,7 @@ app.delete('/api/products/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── INPUT ITEMS (insumos) ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/input-items', authenticate, async (req, res) => {
   try {
     const { q = '' } = req.query;
@@ -849,6 +1118,7 @@ app.get('/api/input-items', authenticate, async (req, res) => {
 app.post('/api/input-items', authenticate, async (req, res) => {
   try {
     const { name, unit, default_cost } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
       'INSERT INTO input_items (client_id, name, unit, default_cost) VALUES ($1, $2, $3, $4) RETURNING *',
       [req.user.client_id, name, unit || 'unidad', default_cost || 0]
@@ -881,7 +1151,7 @@ app.delete('/api/input-items/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── PRODUCT INPUT COMPONENTS ─────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products/:id/components', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -973,7 +1243,7 @@ app.delete('/api/products/:productId/components/:componentId', authenticate, asy
   }
 });
 
-// ─── UPDATE COSTS (products + input-items) ──────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/products/update-costs', authenticate, async (req, res) => {
   try {
     const { productIds = [], newCostPrice, increasePercent, increaseAmount } = req.body;
@@ -1029,7 +1299,44 @@ app.post('/api/input-items/update-costs', authenticate, async (req, res) => {
 
 
 
-// ─── UPDATE PRICES ─────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
+// POST /api/services/update-prices — update service prices (single = newPrice, multi = % or $)
+app.post('/api/services/update-prices', authenticate, async (req, res) => {
+  try {
+    let { serviceIds = [], productIds = [], newPrice, increasePercent, increaseAmount } = req.body;
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) serviceIds = productIds;
+    const ids = (Array.isArray(serviceIds) ? serviceIds : []).map(Number).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ error: 'Sin servicios seleccionados' });
+
+    if (newPrice !== undefined && newPrice !== null) {
+      const { rows } = await pool.query(
+        "UPDATE services SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
+        [Number(newPrice) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rows.length });
+    }
+
+    if (increasePercent !== undefined && increasePercent !== null) {
+      const { rows } = await pool.query(
+        "UPDATE services SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
+        [Number(increasePercent) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rows.length });
+    }
+
+    if (increaseAmount !== undefined && increaseAmount !== null) {
+      const { rows } = await pool.query(
+        "UPDATE services SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id",
+        [Number(increaseAmount) || 0, req.user.client_id, ids]
+      );
+      return res.json({ success: true, updated: result.rows.length });
+    }
+
+    return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
 app.post('/api/products/update-prices', authenticate, async (req, res) => {
   try {
     const { productIds = [], newPrice, increasePercent, increaseAmount } = req.body;
@@ -1041,7 +1348,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(newPrice) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: result.rowCount });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increasePercent !== undefined && increasePercent !== null) {
@@ -1049,7 +1356,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = ROUND(price * (1 + $1::numeric / 100)), updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increasePercent) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: result.rowCount });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     if (increaseAmount !== undefined && increaseAmount !== null) {
@@ -1057,7 +1364,7 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
         `UPDATE products SET price = price + $1, updated_at = NOW() WHERE client_id = $2 AND deleted_at IS NULL AND id = ANY($3::int[]) RETURNING id`,
         [Number(increaseAmount) || 0, req.user.client_id, ids]
       );
-      return res.json({ success: true, updated: result.rowCount });
+      return res.json({ success: true, updated: result.rows.length });
     }
 
     return res.status(400).json({ error: 'Falta newPrice, increasePercent o increaseAmount' });
@@ -1065,9 +1372,9 @@ app.post('/api/products/update-prices', authenticate, async (req, res) => {
 });
 
 
-// ─── CONTACTS ──────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
-// ─── CONDICIONES IVA ────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/condiciones-iva', (req, res) => {
   res.json([
     { value: 'consumidor_final', label: 'Consumidor Final' },
@@ -1123,7 +1430,7 @@ app.delete('/api/contacts/:id', authenticate, async (req, res) => {
 });
 
 
-// ─── CONTACT 360 ─────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
   try {
     const cid = parseInt(req.params.id);
@@ -1139,7 +1446,9 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
 
     // 2. Órdenes del contacto
     const orders = (await pool.query(
-      `SELECT o.*, os.name as status_name, ps.name as payment_status_name
+      `SELECT o.*, os.name as status_name, ps.name as payment_status_name,
+              COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0) AS paid_amount,
+              GREATEST(o.total - COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0), 0) AS balance_due
        FROM orders o
        LEFT JOIN order_statuses os ON o.order_status_id = os.id
        LEFT JOIN payment_statuses ps ON o.payment_status_id = ps.id
@@ -1209,24 +1518,55 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
       [cid, clientId]
     )).rows;
 
+    // 7b. Suscripciones activas
+    const subscriptions = await pool.query(
+      "SELECT s.id, s.plan_id, s.start_date, s.status, s.next_billing_date, s.billing_amount, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount, p.service_id FROM subscriptions s JOIN plans p ON p.id = s.plan_id WHERE s.contact_id = $1 AND s.client_id = $2 AND s.deleted_at IS NULL AND s.status != 'cancelled' ORDER BY s.created_at DESC",
+      [cid, clientId]
+    );
+
+    // 7c. Billing cycles de las suscripciones activas
+    const subIds = subscriptions.rows.map(s => s.id);
+    let billingCycles = [];
+    if (subIds.length > 0) {
+      billingCycles = (await pool.query(
+        "SELECT bc.*, rv.name AS service_name, o.order_number FROM billing_cycles bc LEFT JOIN services rv ON rv.id = (SELECT p.service_id FROM plans p WHERE p.id = (SELECT s.plan_id FROM subscriptions s WHERE s.id = bc.subscription_id)) LEFT JOIN orders o ON bc.order_id = o.id WHERE bc.subscription_id = ANY($1::int[]) AND bc.deleted_at IS NULL ORDER BY bc.due_date DESC",
+        [subIds]
+      )).rows;
+    }
+
     // 8. Estadísticas expandidas
+    // Important: do not join order_items into the order totals query, because it multiplies o.total by item count.
+    // Debt is calculated per NV as SUM(GREATEST(order.total - payments, 0)) so partial payments and overpayments don't distort it.
     const statsRow = (await pool.query(
-      `SELECT
-        COUNT(DISTINCT o.id) as total_orders,
-        COALESCE(SUM(o.total), 0) as total_spent,
-        COALESCE((SELECT SUM(op.amount) FROM order_payments op JOIN orders o2 ON op.order_id = o2.id WHERE o2.contact_id = $1 AND o2.client_id = $2 AND op.deleted_at IS NULL), 0) as total_paid,
-        COALESCE(AVG(o.total), 0) as avg_ticket,
-        MAX(o.created_at) as last_order_date,
-        COUNT(DISTINCT oi.product_id) as unique_products_bought
-       FROM orders o
-       LEFT JOIN order_items oi ON oi.order_id = o.id AND oi.deleted_at IS NULL
-       WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL`,
+      `WITH order_balances AS (
+         SELECT
+           o.id,
+           o.total,
+           o.created_at,
+           COALESCE((SELECT SUM(op.amount) FROM order_payments op WHERE op.order_id = o.id AND op.deleted_at IS NULL), 0) AS paid
+         FROM orders o
+         WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL
+       ), product_stats AS (
+         SELECT COUNT(DISTINCT oi.product_id) AS unique_products_bought
+         FROM order_items oi
+         JOIN orders o ON oi.order_id = o.id
+         WHERE o.contact_id = $1 AND o.client_id = $2 AND o.deleted_at IS NULL AND oi.deleted_at IS NULL
+       )
+       SELECT
+         COUNT(ob.id) AS total_orders,
+         COALESCE(SUM(ob.total), 0) AS total_spent,
+         COALESCE(SUM(ob.paid), 0) AS total_paid,
+         COALESCE(SUM(GREATEST(ob.total - ob.paid, 0)), 0) AS balance,
+         COALESCE(AVG(ob.total), 0) AS avg_ticket,
+         MAX(ob.created_at) AS last_order_date,
+         COALESCE((SELECT unique_products_bought FROM product_stats), 0) AS unique_products_bought
+       FROM order_balances ob`,
       [cid, clientId]
     )).rows[0];
 
     const totalSpent = parseFloat(statsRow.total_spent) || 0;
     const totalPaid = parseFloat(statsRow.total_paid) || 0;
-    const balance = totalSpent - totalPaid;
+    const balance = parseFloat(statsRow.balance) || 0;
 
     res.json({
       contact,
@@ -1244,14 +1584,16 @@ app.get('/api/contacts/:id/360', authenticate, async (req, res) => {
         avg_ticket: parseFloat(statsRow.avg_ticket) || 0,
         last_order_date: statsRow.last_order_date,
         unique_products_bought: parseInt(statsRow.unique_products_bought) || 0
-      }
+      },
+      subscriptions: subscriptions.rows,
+      billing_cycles: billingCycles
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ─── CONTACT NOTES CRUD ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/:id/notes', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1305,11 +1647,11 @@ app.delete('/api/contacts/:contactId/notes/:noteId', authenticate, async (req, r
   }
 });
 
-// ─── SALE CHANNELS ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/sale-channels', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, is_active, sort_order, COALESCE(has_delivery, false) as has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery FROM sale_channels WHERE deleted_at IS NULL AND client_id = $1 AND is_active = true ORDER BY sort_order, name',
+      `SELECT id, name, is_active, sort_order, COALESCE(has_delivery, false) as has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery, COALESCE(auto_invoice, false) as auto_invoice, afip_pos_id, (SELECT ap.name || ' · PV ' || ap.punto_venta FROM afip_points_of_sale ap WHERE ap.id = sale_channels.afip_pos_id) as afip_pos_name FROM sale_channels WHERE deleted_at IS NULL AND client_id = $1 AND is_active = true ORDER BY sort_order, name`,
       [req.user.client_id]
     );
     res.json(result.rows);
@@ -1318,10 +1660,11 @@ app.get('/api/sale-channels', authenticate, async (req, res) => {
 
 app.post('/api/sale-channels', authenticate, async (req, res) => {
   try {
-    const { name, is_active, sort_order, has_delivery, immediate_delivery } = req.body;
+    const { name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
-      'INSERT INTO sale_channels (client_id, name, is_active, sort_order, has_delivery, immediate_delivery) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true, immediate_delivery === true]
+      'INSERT INTO sale_channels (client_id, name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
+      [req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true, immediate_delivery === true, auto_invoice === true, afip_pos_id || null]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -1329,10 +1672,10 @@ app.post('/api/sale-channels', authenticate, async (req, res) => {
 
 app.put('/api/sale-channels/:id', authenticate, async (req, res) => {
   try {
-    const { name, is_active, sort_order, has_delivery, immediate_delivery } = req.body;
+    const { name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id } = req.body;
     const result = await pool.query(
-      'UPDATE sale_channels SET name=COALESCE($1,name), is_active=COALESCE($2,is_active), sort_order=COALESCE($3,sort_order), has_delivery=COALESCE($4,has_delivery), immediate_delivery=COALESCE($5,immediate_delivery) WHERE id=$6 AND client_id=$7 RETURNING *',
-      [name, is_active, sort_order, has_delivery, immediate_delivery, req.params.id, req.user.client_id]
+      'UPDATE sale_channels SET name=COALESCE($1,name), is_active=COALESCE($2,is_active), sort_order=COALESCE($3,sort_order), has_delivery=COALESCE($4,has_delivery), immediate_delivery=COALESCE($5,immediate_delivery), auto_invoice=COALESCE($6,auto_invoice), afip_pos_id=$7 WHERE id=$8 AND client_id=$9 RETURNING *',
+      [name, is_active, sort_order, has_delivery, immediate_delivery, auto_invoice, afip_pos_id || null, req.params.id, req.user.client_id]
     );
     res.json(result.rows[0] || null);
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -1345,7 +1688,7 @@ app.delete('/api/sale-channels/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── ORDER STATUSES ────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/order-statuses', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1359,6 +1702,7 @@ app.get('/api/order-statuses', authenticate, async (req, res) => {
 app.post('/api/order-statuses', authenticate, async (req, res) => {
   try {
     const { name, color, is_active, sort_order } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
       'INSERT INTO order_statuses (client_id, name, color, is_active, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [req.user.client_id, name, color || '#888888', is_active !== false, sort_order || 0]
@@ -1385,7 +1729,7 @@ app.delete('/api/order-statuses/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── PAYMENT STATUSES ──────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-statuses', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -1399,6 +1743,7 @@ app.get('/api/payment-statuses', authenticate, async (req, res) => {
 app.post('/api/payment-statuses', authenticate, async (req, res) => {
   try {
     const { name, color, is_active, sort_order } = req.body;
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
     const result = await pool.query(
       'INSERT INTO payment_statuses (client_id, name, color, is_active, sort_order) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [req.user.client_id, name, color || '#888888', is_active !== false, sort_order || 0]
@@ -1425,11 +1770,11 @@ app.delete('/api/payment-statuses/:id', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── ORDERS (VENTAS) ────────────────────────────────────────────────
-// ─── ORDERS STATS ──────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 
-// ─── EXPENSE CATEGORIES ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/expense-categories', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -1492,7 +1837,7 @@ async function syncExpensePaymentStatus(expenseId, client = pool) {
   if (statusId) await client.query('UPDATE expenses SET payment_status_id=$1, updated_at=NOW() WHERE id=$2', [statusId, expenseId]);
 }
 
-// ─── EXPENSES ─────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/expenses', authenticate, async (req, res) => {
   try {
     const { period = 'month', from, to, date_from, date_to } = req.query;
@@ -1670,7 +2015,7 @@ app.get('/api/orders/stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── DELETE ORDER (soft) ─────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 app.get('/api/orders', authenticate, async (req, res) => {
   try {
@@ -1698,6 +2043,14 @@ app.get('/api/orders', authenticate, async (req, res) => {
         sc.name as sale_channel_name, sc.has_delivery as sale_channel_has_delivery,
         os.name as order_status_name, os.color as order_status_color,
         pst.name as payment_status_name, pst.color as payment_status_color,
+        (SELECT ai.id FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_id,
+        (SELECT ai.cae FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_cae,
+        (SELECT ai.result FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_resultado,
+        (SELECT ai.invoice_type FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_tipo,
+        (SELECT ai.invoice_number FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_numero,
+        (SELECT nc.id FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_id,
+        (SELECT nc.cae FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_cae,
+        (SELECT nc.invoice_number FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_numero,
         GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_paid,
         COALESCE(o.total, 0) - GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_pending
       FROM orders o
@@ -1733,7 +2086,7 @@ app.get('/api/orders', authenticate, async (req, res) => {
         o.payment_status_color = '#e74c3c';
       }
       const items = await pool.query(`
-        SELECT oi.*, p.name as product_name
+        SELECT oi.*, COALESCE(p.name, oi.product_name) as product_name
         FROM order_items oi
         LEFT JOIN products p ON oi.product_id = p.id
         WHERE oi.order_id = $1 AND oi.deleted_at IS NULL
@@ -1795,6 +2148,14 @@ app.get('/api/orders/:id', authenticate, async (req, res) => {
         sc.name as sale_channel_name, sc.has_delivery as sale_channel_has_delivery,
         os.name as order_status_name, os.color as order_status_color,
         pst.name as payment_status_name, pst.color as payment_status_color,
+        (SELECT ai.id FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_id,
+        (SELECT ai.cae FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_cae,
+        (SELECT ai.result FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_resultado,
+        (SELECT ai.invoice_type FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_tipo,
+        (SELECT ai.invoice_number FROM afip_invoices ai WHERE ai.order_id = o.id AND ai.client_id = o.client_id AND ai.result = 'A' ORDER BY ai.id DESC LIMIT 1) as factura_numero,
+        (SELECT nc.id FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_id,
+        (SELECT nc.cae FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_cae,
+        (SELECT nc.invoice_number FROM afip_invoices nc JOIN afip_invoices fi ON fi.id = nc.related_invoice_id WHERE fi.order_id = o.id AND fi.client_id = o.client_id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A' ORDER BY nc.id DESC LIMIT 1) as nc_numero,
         GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_paid,
         COALESCE(o.total, 0) - GREATEST(COALESCE(op.paid_sum, 0), COALESCE(cm.paid_sum, 0)) as payment_pending
       FROM orders o
@@ -1864,11 +2225,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
     } = req.body;
 
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const countResult = await client.query(
-      "SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1",
-      [req.user.client_id]
-    );
-    const orderNum = 'NV-' + String(parseInt(countResult.rows[0].count) + 1).padStart(5, '0');
+    const orderNum = await getNextOrderNumber(client, req.user.client_id);
 
     const subtotal = (items || []).reduce((sum, item) => sum + (Number(item.quantity) * Number(item.unit_price || 0)), 0);
     const fee = Number(delivery_fee) || 0;
@@ -1880,37 +2237,76 @@ app.post('/api/orders', authenticate, async (req, res) => {
     }
     const total = Math.max(0, subtotal - discountAmount + fee);
 
-    // Check has_delivery BEFORE selecting status
-    let initial_status_id = null;
+    // Product fulfillment follows delivery-channel logic.
+    let productFulfillmentStatus = 'pending';
     if (sale_channel_id) {
-      const channelRow = await client.query(
-        'SELECT has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery FROM sale_channels WHERE id = $1 AND deleted_at IS NULL',
+      const productChannelRow = await client.query(
+        'SELECT COALESCE(immediate_delivery, false) as immediate_delivery FROM sale_channels WHERE id = $1 AND deleted_at IS NULL',
         [sale_channel_id]
       );
-      const isImmediateDelivery = channelRow.rows[0]?.immediate_delivery;
+      productFulfillmentStatus = productChannelRow.rows[0]?.immediate_delivery ? 'delivered' : 'pending';
+    }
 
-      if (isImmediateDelivery) {
-        // Immediate delivery = true → use "Entregado" status
-        const deliveredStatusRow = await client.query(
-          "SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL AND LOWER(name) = 'entregado' LIMIT 1",
-          [req.user.client_id]
+    // Determine initial order status.
+    // Service rules:
+    // - any service that creates a work order => order starts pending/pedido
+    // - only services and none creates work order => order starts delivered/entregado
+    // - mixed/product sales keep the normal delivery-channel logic
+    let initial_status_id = null;
+    const serviceItemsForStatus = (items || []).filter(item => item.is_service && item.service_id);
+    let hasWorkOrderService = false;
+    let allItemsAreServices = (items || []).length > 0 && (items || []).every(item => item.is_service);
+    if (serviceItemsForStatus.length > 0) {
+      const serviceIds = [...new Set(serviceItemsForStatus.map(item => Number(item.service_id)).filter(Boolean))];
+      const svcStatusRows = await client.query(
+        'SELECT id, creates_work_order FROM services WHERE client_id = $1 AND deleted_at IS NULL AND id = ANY($2::int[])',
+        [req.user.client_id, serviceIds]
+      );
+      hasWorkOrderService = svcStatusRows.rows.some(s => s.creates_work_order);
+    }
+
+    if (hasWorkOrderService) {
+      const pendingStatusRow = await client.query(
+        "SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL AND LOWER(name) IN ('pendiente','pedido') ORDER BY CASE WHEN LOWER(name) = 'pendiente' THEN 0 ELSE 1 END, sort_order LIMIT 1",
+        [req.user.client_id]
+      );
+      initial_status_id = pendingStatusRow.rows[0]?.id || null;
+    } else if (allItemsAreServices) {
+      const deliveredStatusRow = await client.query(
+        "SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL AND LOWER(name) IN ('entregado','realizado','completado') ORDER BY CASE WHEN LOWER(name) = 'entregado' THEN 0 ELSE 1 END, sort_order LIMIT 1",
+        [req.user.client_id]
+      );
+      initial_status_id = deliveredStatusRow.rows[0]?.id || null;
+    }
+
+    if (!initial_status_id) {
+      if (sale_channel_id) {
+        const channelRow = await client.query(
+          'SELECT has_delivery, COALESCE(immediate_delivery, false) as immediate_delivery FROM sale_channels WHERE id = $1 AND deleted_at IS NULL',
+          [sale_channel_id]
         );
-        initial_status_id = deliveredStatusRow.rows[0]?.id || null;
+        const isImmediateDelivery = channelRow.rows[0]?.immediate_delivery;
+
+        if (isImmediateDelivery) {
+          const deliveredStatusRow = await client.query(
+            "SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL AND LOWER(name) = 'entregado' LIMIT 1",
+            [req.user.client_id]
+          );
+          initial_status_id = deliveredStatusRow.rows[0]?.id || null;
+        } else {
+          const statusRow = await client.query(
+            'SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL ORDER BY sort_order LIMIT 1',
+            [req.user.client_id]
+          );
+          initial_status_id = statusRow.rows[0]?.id || null;
+        }
       } else {
-        // Not immediate → start in first status (Pendiente/Pedido)
         const statusRow = await client.query(
           'SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL ORDER BY sort_order LIMIT 1',
           [req.user.client_id]
         );
         initial_status_id = statusRow.rows[0]?.id || null;
       }
-    } else {
-      // No channel → use first status as default
-      const statusRow = await client.query(
-        'SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL ORDER BY sort_order LIMIT 1',
-        [req.user.client_id]
-      );
-      initial_status_id = statusRow.rows[0]?.id || null;
     }
 
     const payStatusRow = await client.query(
@@ -1920,19 +2316,37 @@ app.post('/api/orders', authenticate, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Normalize attribute_value_id: required if product has attributes, strip if not
+    // -- Items: normalize attributes, skip stock for services --
+    // Collect service info for later work-order creation
+    const woCandidates = [];
     for (const item of (items || [])) {
-      const prodInfo = await client.query('SELECT has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL', [item.product_id]);
+      if (item.is_service) {
+        // Service item: skip stock validation completely
+        item.attribute_value_id = null;
+        // Check if this service creates a work order
+        if (item.service_id) {
+          const svc = await pool.query("SELECT creates_work_order, is_recurring FROM services WHERE id = $1 AND deleted_at IS NULL", [item.service_id]);
+          if (svc.rows.length > 0 && svc.rows[0].is_recurring) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({ error: "No se puede vender un servicio recurrente en esta venta. Usá el módulo Suscripciones." });
+          }
+          item.creates_work_order = svc.rows.length > 0 && svc.rows[0].creates_work_order;
+        }
+        continue;
+      }
+      // Product: normalize attributes
+      const prodInfo = await client.query("SELECT has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL", [item.product_id]);
       const hasAttrs = prodInfo.rows.length > 0 && prodInfo.rows[0].has_attributes;
       if (hasAttrs && !item.attribute_value_id) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'El producto tiene atributos (talles/colores). Cada item debe incluir attribute_value_id. Consultá /api/products/:id para ver los atributos disponibles.' });
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "El producto tiene atributos (talles/colores). Cada item debe incluir attribute_value_id. Consulta /api/products/:id para ver los atributos disponibles." });
       }
       if (!hasAttrs) item.attribute_value_id = null;
     }
 
-    // Stock validation and deduction via helper (handles attributes + global)
+    // Stock validation and deduction (only for non-service items)
     for (const item of (items || [])) {
+      if (item.is_service) continue;
       try {
         await adjustInventoryStock(client, {
           productId: item.product_id,
@@ -1941,7 +2355,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
           increase: false,
         });
       } catch (stockError) {
-        await client.query('ROLLBACK');
+        await client.query("ROLLBACK");
         return res.status(400).json({ error: stockError.message });
       }
     }
@@ -1956,13 +2370,28 @@ app.post('/api/orders', authenticate, async (req, res) => {
     ]);
 
     const orderId = orderResult.rows[0].id;
+    let shouldAutoInvoice = false;
+    if (sale_channel_id) {
+      const autoInvoiceRow = await client.query(
+        'SELECT COALESCE(auto_invoice, false) as auto_invoice, afip_pos_id FROM sale_channels WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+        [sale_channel_id, req.user.client_id]
+      );
+      shouldAutoInvoice = Boolean(autoInvoiceRow.rows[0]?.auto_invoice);
+    }
 
     for (const item of (items || [])) {
-      await client.query(
-        'INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, subtotal, attribute_value_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-        [orderId, item.product_id, item.product_name || item.product_id, Number(item.quantity), Number(item.unit_price), Number(item.quantity) * Number(item.unit_price), item.attribute_value_id || null]
+      const fulfillmentStatus = item.is_service
+        ? (item.creates_work_order ? 'pending' : 'delivered')
+        : productFulfillmentStatus;
+      const insertedItem = await client.query(
+        'INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, subtotal, attribute_value_id, is_service, service_id, fulfillment_status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id',
+        [orderId, item.is_service ? null : item.product_id, item.product_name || item.product_id, Number(item.quantity), Number(item.unit_price), Number(item.quantity) * Number(item.unit_price), item.attribute_value_id || null, item.is_service || false, item.service_id || null, fulfillmentStatus]
       );
+      if (item.is_service && item.creates_work_order) {
+        woCandidates.push({ service_id: item.service_id, service_name: item.product_name || '', order_item_id: insertedItem.rows[0].id });
+      }
     }
+    await recalculateOrderOperationalStatus(client, orderId, req.user.client_id);
 
     // Auto-create delivery if sale_channel has has_delivery = true
     if (sale_channel_id) {
@@ -1979,7 +2408,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
       }
     }
 
-    // ── Process client advance (inside transaction) ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     if (advance_id && Number(advance_amount) > 0) {
       const { rows: advRows } = await client.query('SELECT * FROM advances WHERE id = $1 AND deleted_at IS NULL', [advance_id]);
       if (advRows.length > 0) {
@@ -1999,7 +2428,7 @@ app.post('/api/orders', authenticate, async (req, res) => {
       }
     }
 
-    // ── Process cash payment (efectivo) ──
+    // ─── LEADS STATS ─────────────────────────────────────────────
     const cashAmount = Number(effective_cash_amount) || 0;
     if (cashAmount > 0) {
       const { rows: userRows } = await client.query("SELECT joined_session_id FROM users WHERE id = $1", [effectiveCashUserId(req)]);
@@ -2043,7 +2472,17 @@ app.post('/api/orders', authenticate, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // ── Auto-create Design Requests for products with genera_diseno ──
+
+    // ─── LEADS STATS ─────────────────────────────────────────────
+    for (const wo of woCandidates) {
+      const woTitle = wo.service_name || "Orden de Trabajo";
+      await pool.query(
+        "INSERT INTO work_orders (client_id, contact_id, service_id, order_id, order_item_id, title, status, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        [req.user.client_id, contact_id, wo.service_id, orderId, wo.order_item_id || null, woTitle, "pendiente", req.user.id]
+      );
+    }
+
+    // ─── LEADS STATS ─────────────────────────────────────────────
     try {
       for (const item of (items || [])) {
         const prodDes = await pool.query(
@@ -2072,7 +2511,26 @@ app.post('/api/orders', authenticate, async (req, res) => {
       console.error('Error auto-creating design requests:', designErr.message);
     }
 
-    res.status(201).json({ id: orderId, order_number: orderNum, message: 'Venta creada' });
+    let autoInvoiceResult = null;
+    if (shouldAutoInvoice) {
+      try {
+        const authHeader = req.headers.authorization || '';
+        const autoRes = await fetch(`http://127.0.0.1:${PORT}/api/afip/facturar`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader },
+          body: JSON.stringify({ order_id: orderId })
+        });
+        autoInvoiceResult = await autoRes.json().catch(() => ({ error: 'Respuesta inválida de facturación' }));
+        if (!autoRes.ok || autoInvoiceResult?.success === false) {
+          console.error('Auto-facturación falló para NV', orderId, autoInvoiceResult?.error || autoInvoiceResult?.resultado || autoRes.status);
+        }
+      } catch (autoErr) {
+        autoInvoiceResult = { success: false, error: autoErr.message };
+        console.error('Auto-facturación falló para NV', orderId, autoErr.message);
+      }
+    }
+
+    res.status(201).json({ id: orderId, order_number: orderNum, message: 'Venta creada', auto_invoice: shouldAutoInvoice, auto_invoice_result: autoInvoiceResult });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -2166,6 +2624,53 @@ app.put('/api/orders/:id', authenticate, async (req, res) => {
 
     res.json(updated || null);
   } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+
+// POST /api/orders/:id/finalize - mark all operational parts as finished
+app.post('/api/orders/:id/finalize', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const orderId = req.params.id;
+    await client.query('BEGIN');
+    const { rows: orderRows } = await client.query(
+      'SELECT id FROM orders WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [orderId, req.user.client_id]
+    );
+    if (!orderRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Venta no encontrada' });
+    }
+
+    await client.query(
+      "UPDATE order_items SET fulfillment_status = 'delivered' WHERE order_id = $1 AND deleted_at IS NULL",
+      [orderId]
+    );
+    await client.query(
+      "UPDATE work_orders SET status = 'realizada', completed_at = COALESCE(completed_at, NOW()), updated_at = NOW() WHERE order_id = $1 AND client_id = $2 AND deleted_at IS NULL",
+      [orderId, req.user.client_id]
+    );
+
+    const { rows: deliveredRows } = await client.query(
+      "SELECT id FROM order_statuses WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL AND LOWER(name) IN ('entregado','realizado','completado') ORDER BY CASE WHEN LOWER(name) = 'entregado' THEN 0 ELSE 1 END, sort_order LIMIT 1",
+      [req.user.client_id]
+    );
+    const deliveredId = deliveredRows[0]?.id || null;
+    if (deliveredId) {
+      await client.query('UPDATE orders SET order_status_id = $1, updated_at = NOW() WHERE id = $2 AND client_id = $3', [deliveredId, orderId, req.user.client_id]);
+      await client.query('UPDATE deliveries SET order_status_id = $1, delivered_date = COALESCE(delivered_date, CURRENT_DATE), updated_at = NOW() WHERE order_id = $2 AND client_id = $3 AND deleted_at IS NULL', [deliveredId, orderId, req.user.client_id]);
+    } else {
+      await recalculateOrderOperationalStatus(client, orderId, req.user.client_id);
+    }
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'Venta finalizada' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
 });
 
 app.post('/api/orders/:id/payments', authenticate, async (req, res) => {
@@ -2285,7 +2790,7 @@ app.delete('/api/orders/:id/payments/:paymentId', authenticate, async (req, res)
   }
 });
 
-// ─── LEAD SOURCES ──────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/lead-sources', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
@@ -2342,7 +2847,7 @@ app.delete('/api/lead-sources/:id', authenticate, async (req, res) => {
   }
 });
 
-// ─── LEADS ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/leads', authenticate, async (req, res) => {
   try {
     const result = await pool.query(`
@@ -2664,6 +3169,30 @@ app.delete('/api/leads/:id', authenticate, async (req, res) => {
 
 
 
+app.get('/api/dashboard/mini-summary', authenticate, async (req, res) => {
+  try {
+    const cid = req.user.client_id;
+    const [saldoRes, ventasRes, cobrosRes, otRes, subsRes, entregasRes] = await Promise.all([
+      pool.query("SELECT COALESCE(SUM(CASE WHEN type='in' THEN amount ELSE -amount END), 0) as saldo FROM cash_movements WHERE deleted_at IS NULL AND client_id=$1", [cid]),
+      pool.query("SELECT COALESCE(SUM(total),0) as total, COUNT(*) as count FROM orders WHERE deleted_at IS NULL AND client_id=$1 AND DATE(created_at) = CURRENT_DATE AND order_type='NV'", [cid]),
+      pool.query("SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as count FROM cash_movements WHERE deleted_at IS NULL AND client_id=$1 AND type='in' AND DATE(created_at) = CURRENT_DATE", [cid]),
+      pool.query("SELECT COUNT(*) as count FROM work_orders wo WHERE wo.deleted_at IS NULL AND wo.client_id=$1 AND wo.status IN ('pendiente','en_curso')", [cid]),
+      pool.query("SELECT COUNT(*) as count FROM subscriptions s WHERE s.deleted_at IS NULL AND s.client_id=$1 AND s.status='active' AND s.next_billing_date <= CURRENT_DATE + INTERVAL '7 days'", [cid]),
+      pool.query("SELECT COUNT(*) as count FROM deliveries d WHERE d.deleted_at IS NULL AND d.client_id=$1 AND d.delivered_date IS NULL", [cid]),
+    ]);
+    res.json({
+      saldo_caja: Number(saldoRes.rows[0].saldo),
+      ventas_hoy: Number(ventasRes.rows[0].total),
+      cobros_hoy: Number(cobrosRes.rows[0].total),
+      ot_pendientes: Number(otRes.rows[0].count),
+      suscripciones_vencer: Number(subsRes.rows[0].count),
+      entregas_pendientes: Number(entregasRes.rows[0].count),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/dashboard/owner-stats', authenticate, async (req, res) => {
   try {
     const cid = req.user.client_id;
@@ -2760,7 +3289,7 @@ app.get('/api/dashboard/owner-stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── DASHBOARD SUMMARY ─────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/dashboard/summary', authenticate, async (req, res) => {
   try {
     const cid = req.user.client_id;
@@ -2772,8 +3301,8 @@ app.get('/api/dashboard/summary', authenticate, async (req, res) => {
       pool.query('SELECT COUNT(*) FROM products WHERE client_id = $1 AND is_active = true AND deleted_at IS NULL', [cid]),
       pool.query("SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) = CURRENT_DATE", [cid]),
       pool.query("SELECT COUNT(*) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) >= DATE_TRUNC('month', CURRENT_DATE)", [cid]),
-      pool.query("SELECT COALESCE(SUM(total), 0) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) = CURRENT_DATE AND payment_status = 'paid'", [cid]),
-      pool.query("SELECT COALESCE(SUM(total), 0) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) >= DATE_TRUNC('month', CURRENT_DATE) AND payment_status = 'paid'", [cid]),
+      pool.query("SELECT COALESCE(SUM(total), 0) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) = CURRENT_DATE AND payment_status_id IN (SELECT id FROM payment_statuses WHERE client_id=$1 AND LOWER(name) IN ('paid','pagado','completado'))", [cid]),
+      pool.query("SELECT COALESCE(SUM(total), 0) FROM orders WHERE deleted_at IS NULL AND client_id = $1 AND DATE(created_at) >= DATE_TRUNC('month', CURRENT_DATE) AND payment_status_id IN (SELECT id FROM payment_statuses WHERE client_id=$1 AND LOWER(name) IN ('paid','pagado','completado'))", [cid]),
       pool.query("SELECT COUNT(*) FROM leads WHERE deleted_at IS NULL AND client_id = $1 AND status NOT IN ('converted', 'discarded', 'rejected')", [cid]),
     ]);
 
@@ -2791,9 +3320,9 @@ app.get('/api/dashboard/summary', authenticate, async (req, res) => {
   }
 });
 
-// ─── START ─────────────────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
-// ─── PRODUCT IMAGE UPLOAD ────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 app.post('/api/products/:id/image', authenticate, async (req, res) => {
   try {
@@ -2835,7 +3364,7 @@ app.post('/api/products/:id/image', authenticate, async (req, res) => {
   }
 });
 
-// ─── SERVE IMAGES ───────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 const imageDir = '/var/www/dash-images';
 const templateDir = '/var/www/baver/templates';
 const uploadDir = '/var/www/baver/uploads';
@@ -2847,7 +3376,7 @@ app.use('/plantillas', express.static('/var/www/baver/Plantilla clientes'));
 
 
 
-// ─── LEAD MATCH & MERGE ────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // POST /api/leads/:id/verify-match
 // Checks if lead matches any existing contact by phone/whatsapp/email/instagram
@@ -2867,10 +3396,10 @@ app.post('/api/leads/:id/verify-match', authenticate, async (req, res) => {
       `SELECT * FROM contacts
        WHERE deleted_at IS NULL AND client_id = $1
          AND (
-           ($2 IS NOT NULL AND phone = $2)
-           OR ($2 IS NOT NULL AND whatsapp = $2)
-           OR ($3 IS NOT NULL AND email = $3)
-           OR ($4 IS NOT NULL AND instagram = $4)
+           ($2::text IS NOT NULL AND phone = $2::text)
+           OR ($2::text IS NOT NULL AND whatsapp = $2::text)
+           OR ($3::text IS NOT NULL AND email = $3::text)
+           OR ($4::text IS NOT NULL AND instagram = $4::text)
          )
        LIMIT 1`,
       [req.user.client_id, cleanText(lead.phone), cleanText(lead.email), cleanText(lead.instagram)]
@@ -2972,11 +3501,49 @@ app.post('/api/leads/:id/resolve', authenticate, async (req, res) => {
 app.delete('/api/orders/:id', authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
+    // No permitir eliminar ventas facturadas sin Nota de Crédito autorizada
+    const { rows: fiscalRows } = await client.query(`
+      SELECT fi.id as factura_id, fi.cae as factura_cae, nc.id as nc_id
+      FROM afip_invoices fi
+      LEFT JOIN afip_invoices nc ON nc.related_invoice_id = fi.id AND nc.voucher_kind = 'credit_note' AND nc.result = 'A'
+      WHERE fi.order_id = $1 AND fi.client_id = $2 AND fi.voucher_kind = 'invoice' AND fi.result = 'A'
+      ORDER BY fi.id DESC
+      LIMIT 1
+    `, [req.params.id, req.user.client_id]);
+    if (fiscalRows.length > 0 && !fiscalRows[0].nc_id) {
+      return res.status(400).json({
+        error: 'No se puede eliminar una venta facturada sin emitir antes Nota de Crédito',
+        details: 'Emití la NC de la factura y luego eliminá la venta si corresponde.',
+        factura_id: fiscalRows[0].factura_id,
+        factura_cae: fiscalRows[0].factura_cae,
+        requires_credit_note: true,
+      });
+    }
+
+    // Verificar si la orden tiene pagos asociados
+    const { rows: payments } = await client.query(
+      'SELECT op.id, op.amount, pm.name AS method, op.paid_at FROM order_payments op LEFT JOIN payment_methods pm ON pm.id = op.payment_method_id WHERE op.order_id = $1 AND op.deleted_at IS NULL ORDER BY op.paid_at',
+      [req.params.id]
+    );
+    if (payments.length > 0) {
+      return res.status(400).json({
+        error: 'No se puede eliminar una venta con cobros asociados',
+        details: 'Eliminá los cobros primero',
+        payments: payments.map(p => ({ id: p.id, amount: p.amount, method: p.method || '-', paid_at: p.paid_at }))
+      });
+    }
+
     await client.query('BEGIN');
-    const delItems = await client.query('SELECT product_id, quantity, attribute_value_id FROM order_items WHERE order_id = $1 AND deleted_at IS NULL', [req.params.id]);
+    const delItems = await client.query('SELECT product_id, quantity, attribute_value_id, is_service FROM order_items WHERE order_id = $1 AND deleted_at IS NULL', [req.params.id]);
     for (const item of delItems.rows) {
+      if (item.is_service) continue;
       await adjustInventoryStock(client, { productId: item.product_id, quantity: Number(item.quantity), attributeValueId: item.attribute_value_id, increase: true });
     }
+    // Liberar billing cycles vinculados a esta orden (vuelven a pending)
+    await client.query(
+      "UPDATE billing_cycles SET order_id = NULL, order_item_id = NULL, status = 'pending', updated_at = NOW() WHERE order_id = $1 AND deleted_at IS NULL",
+      [req.params.id]
+    );
     await client.query('UPDATE orders SET deleted_at = NOW() WHERE id = $1', [req.params.id]);
     await client.query('COMMIT');
     res.json({ message: 'Venta eliminada' });
@@ -2986,28 +3553,35 @@ app.delete('/api/orders/:id', authenticate, async (req, res) => {
   } finally { client.release(); }
 });
 
-// ─── ORDER ITEMS (for edit) ─────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.post('/api/orders/:id/items', authenticate, async (req, res) => {
   const client = await pool.connect();
   try {
-    const { product_id, quantity, unit_price } = req.body;
+    const { product_id, quantity, unit_price, service_id } = req.body;
     const orderId = req.params.id;
 
     // Verify order belongs to client
     const order = await client.query('SELECT id, total FROM orders WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL', [orderId, req.user.client_id]);
     if (!order.rows[0]) return res.status(404).json({ error: 'Orden no encontrada' });
 
-    // Get product info
-    const prod = await client.query('SELECT name, requires_stock, has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL', [product_id]);
-    if (!prod.rows[0]) return res.status(400).json({ error: 'Producto no encontrado' });
-    const prodData = prod.rows[0];
+    // Determine if this is a product or a service
+    let prodData = null;
+    if (req.body.is_service && req.body.service_id) {
+      const svc = await client.query('SELECT id, name, price, creates_work_order FROM services WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL', [req.body.service_id, req.user.client_id]);
+      if (!svc.rows[0]) return res.status(400).json({ error: 'Servicio no encontrado' });
+      prodData = { name: svc.rows[0].name, requires_stock: false, has_attributes: false, is_service: true, service_id: svc.rows[0].id, creates_work_order: svc.rows[0].creates_work_order };
+    } else {
+      const prod = await client.query('SELECT name, requires_stock, has_attributes FROM products WHERE id = $1 AND deleted_at IS NULL', [product_id]);
+      if (!prod.rows[0]) return res.status(400).json({ error: 'Producto no encontrado' });
+      prodData = prod.rows[0];
+    }
 
-    // Require attribute_value_id if product has attributes
-    if (prodData.has_attributes && !req.body.attribute_value_id) {
+    // Require attribute_value_id if product has attributes (skip for services)
+    if (!prodData.is_service && prodData.has_attributes && !req.body.attribute_value_id) {
       return res.status(400).json({ error: 'El producto tiene atributos. Incluí attribute_value_id en el body.' });
     }
 
-    // Stock check
+    // Stock check (skip for services)
     if (prodData.requires_stock) {
       if (Number(quantity) > Number(prodData.stock_quantity || 0)) {
         return res.status(400).json({ error: `Stock insuficiente para "${prodData.name}". Disponible: ${prodData.stock_quantity}` });
@@ -3016,20 +3590,17 @@ app.post('/api/orders/:id/items', authenticate, async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Deduct stock (handles attributes + global)
-    if (prodData.requires_stock) {
+    // Deduct stock (handles attributes + global) - skip for services
+    if (!prodData.is_service && prodData.requires_stock) {
       if (prodData.has_attributes && req.body.attribute_value_id) {
-        await client.query('UPDATE product_attributes SET stock_quantity = stock_quantity - $1 WHERE product_id = $2 AND attribute_value_id = $3', [quantity, product_id, req.body.attribute_value_id]);
-        await client.query('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2', [quantity, product_id]);
-      } else {
         await client.query('UPDATE products SET stock_quantity = stock_quantity - $1 WHERE id = $2', [quantity, product_id]);
       }
     }
 
     // Add item
     const itemResult = await client.query(
-      'INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, subtotal, attribute_value_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-      [orderId, product_id, prodData.name, quantity, unit_price, Number(quantity) * Number(unit_price), req.body.attribute_value_id || null]
+      'INSERT INTO order_items (order_id, product_id, product_name, quantity, unit_price, subtotal, attribute_value_id, is_service, service_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [orderId, prodData.is_service ? null : product_id, prodData.name, quantity, unit_price, Number(quantity) * Number(unit_price), req.body.attribute_value_id || null, prodData.is_service || false, prodData.service_id || null]
     );
 
     // Recalculate order total
@@ -3070,7 +3641,7 @@ app.put('/api/orders/:id/items/:itemId', authenticate, async (req, res) => {
     await client.query('BEGIN');
 
     // Get current item
-    const item = await client.query('SELECT product_id, quantity FROM order_items WHERE id = $1 AND order_id = $2 AND deleted_at IS NULL', [itemId, orderId]);
+    const item = await client.query('SELECT product_id, quantity, is_service FROM order_items WHERE id = $1 AND order_id = $2 AND deleted_at IS NULL', [itemId, orderId]);
     if (!item.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item no encontrado' }); }
     const oldQty = Number(item.rows[0].quantity);
     const newQty = Number(quantity);
@@ -3134,7 +3705,7 @@ app.delete('/api/orders/:id/items/:itemId', authenticate, async (req, res) => {
     await client.query('BEGIN');
 
     // Get item to restore stock
-    const item = await client.query('SELECT product_id, quantity FROM order_items WHERE id = $1 AND order_id = $2 AND deleted_at IS NULL', [itemId, orderId]);
+    const item = await client.query('SELECT product_id, quantity, is_service FROM order_items WHERE id = $1 AND order_id = $2 AND deleted_at IS NULL', [itemId, orderId]);
     if (item.rows[0]) {
       await client.query('UPDATE products SET stock_quantity = stock_quantity + $1 WHERE id = $2 AND requires_stock = true', [item.rows[0].quantity, item.rows[0].product_id]);
       await client.query('UPDATE order_items SET deleted_at = NOW() WHERE id = $1', [itemId]);
@@ -3167,12 +3738,12 @@ app.delete('/api/orders/:id/items/:itemId', authenticate, async (req, res) => {
 
 
 
-// ─── PRODUCTS STATS ───────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/products/stats', authenticate, async (req, res) => {
   try {
     const { period } = req.query;
     let dateFilter = '';
-    const params = [];
+    const params = [req.user.client_id];
     if (period === 'today') dateFilter = "AND DATE(created_at) = CURRENT_DATE";
     else if (period === 'week') dateFilter = "AND DATE(created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
     else if (period === 'month') dateFilter = "AND DATE(created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
@@ -3200,12 +3771,12 @@ app.get('/api/products/stats', authenticate, async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// ─── CONTACTS STATS ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/contacts/stats', authenticate, async (req, res) => {
   try {
     const { period } = req.query;
     let dateFilter = '';
-    const params = [];
+    const params = [req.user.client_id];
     if (period === 'today') dateFilter = "AND DATE(c.created_at) = CURRENT_DATE";
     else if (period === 'week') dateFilter = "AND DATE(c.created_at) >= DATE_TRUNC('week', CURRENT_DATE)";
     else if (period === 'month') dateFilter = "AND DATE(c.created_at) >= DATE_TRUNC('month', CURRENT_DATE)";
@@ -3229,9 +3800,183 @@ app.get('/api/contacts/stats', authenticate, async (req, res) => {
     });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
+// GET /api/products/report - exportar reporte Excel
+app.get('/api/products/report', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT p.*, pc.name AS category_name, pb.name AS brand_name
+       FROM products p
+       LEFT JOIN product_categories pc ON pc.id = p.category_id AND pc.deleted_at IS NULL
+       LEFT JOIN product_brands pb ON pb.id = p.brand_id AND pb.deleted_at IS NULL
+       WHERE p.client_id = $1 AND p.deleted_at IS NULL
+       ORDER BY p.name`,
+      [req.user.client_id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// POST /api/products/import - importar productos desde Excel
+app.post('/api/products/import', authenticate, async (req, res) => {
+  const { products } = req.body;
+  if (!products || !Array.isArray(products) || products.length === 0) {
+    return res.status(400).json({ error: 'Se requiere un array products' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let created = 0, updated = 0;
+    const errorDetails = [];
+
+    for (const p of products) {
+      try {
+        // Lookup or create category
+        let catId = null;
+        if (p.category && p.category.trim() && p.category !== 'General') {
+          const cat = await client.query(
+            'SELECT id FROM product_categories WHERE client_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL',
+            [req.user.client_id, p.category.trim()]
+          );
+          if (cat.rows.length > 0) {
+            catId = cat.rows[0].id;
+          } else {
+            const newCat = await client.query(
+              'INSERT INTO product_categories (client_id, name) VALUES ($1, $2) RETURNING id',
+              [req.user.client_id, p.category.trim()]
+            );
+            catId = newCat.rows[0].id;
+          }
+        }
+
+        // Lookup or create brand
+        let brandId = null;
+        if (p.brand && p.brand.trim() && p.brand !== 'Generica') {
+          const br = await client.query(
+            'SELECT id FROM product_brands WHERE client_id = $1 AND LOWER(name) = LOWER($2) AND deleted_at IS NULL',
+            [req.user.client_id, p.brand.trim()]
+          );
+          if (br.rows.length > 0) {
+            brandId = br.rows[0].id;
+          } else {
+            const newBr = await client.query(
+              'INSERT INTO product_brands (client_id, name) VALUES ($1, $2) RETURNING id',
+              [req.user.client_id, p.brand.trim()]
+            );
+            brandId = newBr.rows[0].id;
+          }
+        }
+
+        const isActive = p.ACTIVO === 'Si' || p.ACTIVO === 'S' || String(p.activo || p.is_active || '').toLowerCase() === 'true' || true;
+
+        // Upsert by SKU
+        if (p.sku && p.sku.trim()) {
+          const existing = await client.query(
+            'SELECT id FROM products WHERE client_id = $1 AND sku = $2 AND deleted_at IS NULL',
+            [req.user.client_id, p.sku.trim()]
+          );
+          if (existing.rows.length > 0) {
+            await client.query(
+              `UPDATE products SET
+                name = COALESCE($1, name),
+                sku_externo = COALESCE($2, sku_externo),
+                description = COALESCE($3, description),
+                commercial_description = COALESCE($4, commercial_description),
+                price = COALESCE($5, price),
+                cost_price = COALESCE($6, cost_price),
+                unit = COALESCE($7, unit),
+                stock_quantity = COALESCE($8, stock_quantity),
+                min_stock = COALESCE($9, min_stock),
+                category_id = COALESCE($10, category_id),
+                brand_id = COALESCE($11, brand_id),
+                is_active = $12
+              WHERE id = $13`,
+              [
+                p.name || null,
+                p.codigo || p.sku_externo || null,
+                p.description || p.DESCRIPCION || null,
+                p.commercial_description || p.DESCRIPCION_COMERCIAL || null,
+                p.price != null ? p.price : null,
+                p.costo || p.cost_price || null,
+                p.unit || p.UNIDAD || null,
+                p.stock != null ? p.stock : (p.stock_quantity != null ? p.stock_quantity : null),
+                p.minimo != null ? p.minimo : (p.min_stock != null ? p.min_stock : null),
+                catId,
+                brandId,
+                isActive,
+                existing.rows[0].id
+              ]
+            );
+            updated++;
+          } else {
+            await client.query(
+              `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description,
+                price, cost_price, unit, stock_quantity, min_stock, category_id, brand_id, is_active)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+              [
+                req.user.client_id,
+                p.sku.trim(),
+                p.codigo || p.sku_externo || '',
+                p.name || p.NOMBRE || '',
+                p.description || p.DESCRIPCION || '',
+                p.commercial_description || p.DESCRIPCION_COMERCIAL || '',
+                p.price != null ? p.price : 0,
+                p.costo || p.cost_price || 0,
+                p.unit || p.UNIDAD || 'unidad',
+                p.stock != null ? p.stock : (p.stock_quantity || 0),
+                p.minimo != null ? p.minimo : (p.min_stock || 0),
+                catId,
+                brandId,
+                isActive,
+              ]
+            );
+            created++;
+          }
+        } else {
+          // No SKU: always insert
+          await client.query(
+            `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description,
+              price, cost_price, unit, stock_quantity, min_stock, category_id, brand_id, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+            [
+              req.user.client_id,
+              p.sku || '',
+              p.codigo || p.sku_externo || '',
+              p.name || p.NOMBRE || '',
+              p.description || p.DESCRIPCION || '',
+              p.commercial_description || p.DESCRIPCION_COMERCIAL || '',
+              p.price != null ? p.price : 0,
+              p.costo || p.cost_price || 0,
+              p.unit || p.UNIDAD || 'unidad',
+              p.stock != null ? p.stock : (p.stock_quantity || 0),
+              p.minimo != null ? p.minimo : (p.min_stock || 0),
+              catId,
+              brandId,
+              isActive,
+            ]
+          );
+          created++;
+        }
+      } catch (err) {
+        errorDetails.push({ sku: p.sku || p.NOMBRE || '?', error: err.message });
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ created, updated, errors: errorDetails.length, errorDetails });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
 
 // ─── LEADS STATS ─────────────────────────────────────────────
-app.get('/api/leads/stats', authenticate, async (req, res) => {
+app.get("/api/leads/stats", authenticate, async (req, res) => {
   try {
     const { period } = req.query;
     let dateFilter = '';
@@ -3277,7 +4022,7 @@ app.get('/api/leads/stats', authenticate, async (req, res) => {
 });
 
 
-// ─── COBROS MODULE ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 // Cash Sessions (Cobros)
 app.get('/api/cash-sessions', async (req, res) => {
   try {
@@ -3288,7 +4033,7 @@ app.get('/api/cash-sessions', async (req, res) => {
     sql += ' ORDER BY cs.opened_at DESC LIMIT 50';
     const { rows } = await pool.query(sql, params);
     for (const s of rows) {
-      const mv = await pool.query("SELECT cm.*, fa.name as account_name, c.name as contact_name, o.order_number, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN contacts c ON cm.contact_id = c.id LEFT JOIN orders o ON cm.order_id = o.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.type = 'out' ORDER BY cm.created_at DESC", [s.id, 'cash']);
+      const mv = await pool.query("SELECT cm.*, fa.name as account_name, c.name as contact_name, o.order_number, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN contacts c ON cm.contact_id = c.id LEFT JOIN orders o ON cm.order_id = o.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.type = 'out' ORDER BY cm.created_at DESC", [s.id]);
       s.movements = mv.rows;
       s.total_in = mv.rows.filter(m => m.type === 'in').reduce((sum, m) => sum + Number(m.amount), 0);
       s.total_out = mv.rows.filter(m => m.type === 'out').reduce((sum, m) => sum + Number(m.amount), 0);
@@ -3653,13 +4398,17 @@ app.get('/api/cash-movements', async (req, res) => {
     const typeF = type ? `AND cm.type = '${type}'` : '';
     const { rows } = await pool.query(
       `SELECT cm.*, fa.name as account_name, c.name as client_name,
-              prov.name as supplier_name, o.order_number, po.order_number as po_number
+              prov.name as supplier_name, o.order_number, po.order_number as po_number,
+              bc.id as billing_cycle_id, sp.name as subscription_plan_name
        FROM cash_movements cm
        LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id
-       LEFT JOIN contacts c ON cm.client_id = c.id
+       LEFT JOIN contacts c ON COALESCE(cm.contact_id, cm.client_id) = c.id
        LEFT JOIN providers prov ON cm.supplier_id = prov.id
        LEFT JOIN orders o ON cm.order_id = o.id
        LEFT JOIN purchase_orders po ON cm.purchase_order_id = po.id
+       LEFT JOIN billing_cycles bc ON bc.id = cm.billing_cycle_id
+       LEFT JOIN subscriptions sub ON sub.id = bc.subscription_id
+       LEFT JOIN plans sp ON sp.id = sub.plan_id
        WHERE cm.deleted_at IS NULL ${dateF} ${typeF}
        ORDER BY cm.created_at DESC LIMIT 200`
     );
@@ -3669,7 +4418,7 @@ app.get('/api/cash-movements', async (req, res) => {
 
 app.post('/api/cash-movements', authenticate, async (req, res) => {
   try {
-    const { financial_account_id, type = 'in', reason = 'other_in', order_id, contact_id, supplier_id, purchase_order_id, expense_id, amount, notes } = req.body;
+    const { financial_account_id, type = 'in', reason = 'other_in', order_id, contact_id, client_id, supplier_id, purchase_order_id, expense_id, billing_cycle_id, amount, notes } = req.body;
     if (!financial_account_id || !amount) return res.status(400).json({ error: 'Faltan campos requeridos' });
     const user_id = effectiveCashUserId(req);
     let session_id;
@@ -3691,12 +4440,29 @@ app.post('/api/cash-movements', authenticate, async (req, res) => {
     }
     // Get client_id: from order if order_id exists, otherwise from user
     let cash_client_id = req.user?.client_id;
+    let movement_contact_id = contact_id || client_id || null;
     if (order_id) {
-      const orderClient = await pool.query("SELECT client_id FROM orders WHERE id = $1", [order_id]);
+      const orderClient = await pool.query("SELECT client_id, contact_id FROM orders WHERE id = $1", [order_id]);
       if (orderClient.rows[0]?.client_id) cash_client_id = orderClient.rows[0].client_id;
+      if (!movement_contact_id && orderClient.rows[0]?.contact_id) movement_contact_id = orderClient.rows[0].contact_id;
+    }
+    if (billing_cycle_id) {
+      const bcInfo = await pool.query(
+        `SELECT bc.id, bc.amount, bc.status, bc.client_id, s.contact_id, p.name AS plan_name, c.name AS contact_name
+         FROM billing_cycles bc
+         JOIN subscriptions s ON s.id = bc.subscription_id
+         JOIN plans p ON p.id = s.plan_id
+         JOIN contacts c ON c.id = s.contact_id
+         WHERE bc.id = $1 AND bc.deleted_at IS NULL`,
+        [billing_cycle_id]
+      );
+      if (!bcInfo.rows[0]) return res.status(404).json({ error: 'Ciclo de facturación no encontrado' });
+      if (bcInfo.rows[0].status === 'paid') return res.status(400).json({ error: 'El ciclo ya está pagado' });
+      cash_client_id = bcInfo.rows[0].client_id;
+      movement_contact_id = bcInfo.rows[0].contact_id;
     }
 
-    const { rows } = await pool.query("INSERT INTO cash_movements (session_id, session_type, financial_account_id, type, reason, order_id, client_id, supplier_id, purchase_order_id, expense_id, amount, notes, created_at) VALUES (COALESCE($1, (SELECT id FROM cash_sessions WHERE status = 'open' AND deleted_at IS NULL ORDER BY opened_at DESC LIMIT 1)), 'cash', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW()) RETURNING *", [session_id, financial_account_id, type, reason, order_id || null, cash_client_id, supplier_id || null, purchase_order_id || null, expense_id || null, amount, notes || null]);
+    const { rows } = await pool.query("INSERT INTO cash_movements (session_id, session_type, financial_account_id, type, reason, order_id, contact_id, client_id, supplier_id, purchase_order_id, expense_id, billing_cycle_id, amount, notes, created_at) VALUES (COALESCE($1, (SELECT id FROM cash_sessions WHERE status = 'open' AND deleted_at IS NULL ORDER BY opened_at DESC LIMIT 1)), 'cash', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW()) RETURNING *", [session_id, financial_account_id, type, reason, order_id || null, movement_contact_id, cash_client_id, supplier_id || null, purchase_order_id || null, expense_id || null, billing_cycle_id || null, amount, notes || null]);
     if (reason === 'expense_payment' && expense_id) {
       await syncExpensePaymentStatus(expense_id);
     }
@@ -3739,16 +4505,96 @@ app.post('/api/cash-movements', authenticate, async (req, res) => {
         }
       }
     }
+    if (reason === 'subscription_payment' && billing_cycle_id) {
+      await pool.query(
+        'UPDATE billing_cycles SET status = $1, paid_at = NOW(), paid_amount = $2, updated_at = NOW() WHERE id = $3 AND deleted_at IS NULL',
+        ['paid', amount, billing_cycle_id]
+      );
+    }
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/cash-movements/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query("UPDATE cash_movements SET deleted_at = NOW() WHERE id = $1 AND session_type = 'cash' RETURNING expense_id", [req.params.id]);
-    if (rows[0]?.expense_id) await syncExpensePaymentStatus(rows[0].expense_id);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    await client.query('BEGIN');
+    // Obtener el cash_movement antes de borrarlo
+    const { rows: cmRow } = await client.query(
+      'SELECT id, order_id, purchase_order_id, expense_id, amount, type FROM cash_movements WHERE id = $1 AND deleted_at IS NULL',
+      [req.params.id]
+    );
+    if (!cmRow[0]) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Movimiento no encontrado' });
+    }
+    const cm = cmRow[0];
+
+    // Soft-delete el cash_movement
+    await client.query("UPDATE cash_movements SET deleted_at = NOW() WHERE id = $1", [req.params.id]);
+
+    // Si es un cobro de NV (order_id presente), también eliminar el order_payment
+    // y recalcular payment_status_id de la orden
+    if (cm.order_id) {
+      // Buscar el order_payment más cercano en monto y fecha para esta orden
+      const { rows: opRows } = await client.query(
+        `SELECT id, amount FROM order_payments
+         WHERE order_id = $1 AND deleted_at IS NULL
+         ORDER BY ABS(amount - $2) ASC, paid_at DESC LIMIT 1`,
+        [cm.order_id, cm.amount]
+      );
+      if (opRows[0]) {
+        await client.query("UPDATE order_payments SET deleted_at = NOW() WHERE id = $1", [opRows[0].id]);
+      }
+
+      // Recalcular payment_status_id de la orden
+      const { rows: remaining } = await client.query(
+        'SELECT COALESCE(SUM(amount), 0) as total_paid, (SELECT total FROM orders WHERE id = $1) as total FROM order_payments WHERE order_id = $1 AND deleted_at IS NULL',
+        [cm.order_id]
+      );
+      const totalPaid = Number(remaining[0].total_paid);
+      const total = Number(remaining[0].total);
+      // Status IDs: 1=Pendiente, 2=Pagado Parcial, 3=Pagado
+      let newStatusId = 1; // Pendiente
+      if (totalPaid >= total && total > 0) {
+        newStatusId = 3; // Pagado
+      } else if (totalPaid > 0) {
+        newStatusId = 2; // Pagado Parcial
+      }
+      await client.query('UPDATE orders SET payment_status_id = $2, updated_at = NOW() WHERE id = $1',
+        [cm.order_id, newStatusId]);
+    }
+
+    // Si es un pago de NP (purchase_order_id presente), hacer lo mismo
+    if (cm.purchase_order_id) {
+      // Recalcular payment_status de la purchase_order
+      const { rows: remaining } = await client.query(
+        `SELECT COALESCE(SUM(amount), 0) as total_paid, (SELECT total FROM purchase_orders WHERE id = $1) as total
+         FROM cash_movements WHERE purchase_order_id = $1 AND deleted_at IS NULL AND type = 'out'`,
+        [cm.purchase_order_id]
+      );
+      const totalPaid = Number(remaining[0].total_paid);
+      const total = Number(remaining[0].total);
+      await client.query(
+        "UPDATE purchase_orders SET payment_paid = $1, payment_status_id = CASE WHEN $1 >= total THEN 3 WHEN $1 > 0 THEN 2 ELSE 1 END WHERE id = $2",
+        [totalPaid, cm.purchase_order_id]
+      );
+    }
+
+    // Si tenía expense_id, sync como antes
+    if (cm.expense_id) {
+      const expenseCheck = await client.query('SELECT id FROM expenses WHERE id = $1 AND deleted_at IS NULL', [cm.expense_id]);
+      if (expenseCheck.rows[0]) {
+        await syncExpensePaymentStatus(cm.expense_id, client);
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({ ok: true, message: 'Movimiento anulado. Se actualizó el estado de pago de la orden asociada.' });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
 });
 
 app.get('/api/cash/stats', async (req, res) => {
@@ -3776,7 +4622,7 @@ app.get('/api/cash/stats', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── COMPRAS MODULE ─────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 
 // --- PROVIDERS ---
 app.get('/api/providers', async (req, res) => {
@@ -4040,6 +4886,19 @@ app.put('/api/purchase-orders/:id', authenticate, async (req, res) => {
 app.delete('/api/purchase-orders/:id', async (req, res) => {
   const client = await pool.connect();
   try {
+    // Verificar si la compra tiene pagos asociados (cash_movements)
+    const { rows: payments } = await client.query(
+      'SELECT cm.id, cm.amount, fa.name AS method, cm.created_at FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id WHERE cm.purchase_order_id = $1 AND cm.deleted_at IS NULL ORDER BY cm.created_at',
+      [req.params.id]
+    );
+    if (payments.length > 0) {
+      return res.status(400).json({
+        error: 'No se puede eliminar una compra con pagos asociados',
+        details: 'Eliminá los pagos primero',
+        payments: payments.map(p => ({ id: p.id, amount: p.amount, method: p.method || '-', paid_at: p.created_at }))
+      });
+    }
+
     await client.query('BEGIN');
     const { rows: orderRows } = await client.query(
       `SELECT po.*, ps.name as status_name
@@ -4077,9 +4936,7 @@ app.delete('/api/purchase-orders/:id', async (req, res) => {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
   } finally { client.release(); }
-});
-
-app.post('/api/purchase-orders/:id/receive', async (req, res) => {
+});app.post('/api/purchase-orders/:id/receive', async (req, res) => {
   try {
     const allocations = Array.isArray(req.body?.allocations) ? req.body.allocations : [];
     const { rows: orderRows } = await pool.query('SELECT * FROM purchase_orders WHERE id = $1 AND deleted_at IS NULL', [req.params.id]);
@@ -4249,18 +5106,19 @@ app.get('/api/purchase-statuses', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/purchase-statuses', async (req, res) => {
+app.post('/api/purchase-statuses', authenticate, async (req, res) => {
   try {
     const { name, color, sort_order } = req.body;
-    const { rows } = await pool.query('INSERT INTO purchase_statuses (name, color, sort_order) VALUES ($1, $2, $3) RETURNING *', [name, color || '#888', sort_order || 0]);
+    if (!name || !String(name).trim()) return res.status(400).json({ error: 'Nombre requerido' });
+    const { rows } = await pool.query('INSERT INTO purchase_statuses (client_id, name, color, sort_order) VALUES ($1, $2, $3, $4) RETURNING *', [req.user.client_id, name, color || '#888', sort_order || 0]);
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/purchase-statuses/:id', async (req, res) => {
+app.put('/api/purchase-statuses/:id', authenticate, async (req, res) => {
   try {
     const { name, color, sort_order } = req.body;
-    await pool.query('UPDATE purchase_statuses SET name = COALESCE($1, name), color = COALESCE($2, color), sort_order = COALESCE($3, sort_order) WHERE id = $4', [name, color, sort_order, req.params.id]);
+    await pool.query('UPDATE purchase_statuses SET name = COALESCE($1, name), color = COALESCE($2, color), sort_order = COALESCE($3, sort_order) WHERE id = $4 AND client_id = $5', [name, color, sort_order, req.params.id, req.user.client_id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4272,7 +5130,7 @@ app.delete('/api/purchase-statuses/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── PAGOS MODULE ────────────────────────────────────────────
+// ─── LEADS STATS ─────────────────────────────────────────────
 app.get('/api/payment-sessions', async (req, res) => {
   try {
     const { status } = req.query;
@@ -4282,7 +5140,7 @@ app.get('/api/payment-sessions', async (req, res) => {
     sql += ' ORDER BY cs.opened_at DESC LIMIT 50';
     const { rows } = await pool.query(sql, params);
     for (const s of rows) {
-      const mv = await pool.query("SELECT cm.*, fa.name as account_name, prov.name as provider_name, po.order_number, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN contacts sup ON cm.supplier_id = sup.id LEFT JOIN orders po ON cm.order_id = po.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.session_type = $2 ORDER BY cm.created_at DESC", [s.id, 'pagos']);
+      const mv = await pool.query("SELECT cm.*, fa.name as account_name, COALESCE(prov.name, sup.name) as provider_name, po.order_number, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN contacts sup ON cm.supplier_id = sup.id LEFT JOIN providers prov ON cm.supplier_id = prov.id LEFT JOIN orders po ON cm.order_id = po.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.session_type = $2 ORDER BY cm.created_at DESC", [s.id, 'pagos']);
       s.movements = mv.rows;
       s.total_in = mv.rows.filter(m => m.type === 'in').reduce((sum, m) => sum + Number(m.amount), 0);
       s.total_out = mv.rows.filter(m => m.type === 'out').reduce((sum, m) => sum + Number(m.amount), 0);
@@ -4309,7 +5167,7 @@ app.get('/api/payment-sessions/current', async (req, res) => {
     const { rows } = await pool.query("SELECT cs.*, u.name as user_name FROM cash_sessions cs LEFT JOIN users u ON cs.user_id = u.id WHERE cs.user_id = $1 AND cs.status = 'open' AND cs.session_type = 'pagos' ORDER BY cs.opened_at DESC LIMIT 1", [user_id]);
     if (rows.length === 0) return res.json(null);
     const sess = rows[0];
-    const mv = await pool.query("SELECT cm.*, fa.name as account_name, prov.name as provider_name, prov.name as supplier_name, po.order_number, po.payment_status_id, pst.name as payment_status_name, pst.color as payment_status_color, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN purchase_orders po ON cm.purchase_order_id = po.id LEFT JOIN providers prov ON COALESCE(cm.supplier_id, po.provider_id) = prov.id LEFT JOIN payment_statuses pst ON po.payment_status_id = pst.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.session_type = $2 ORDER BY cm.created_at DESC", [sess.id]);
+    const mv = await pool.query("SELECT cm.*, fa.name as account_name, prov.name as provider_name, prov.name as supplier_name, po.order_number, po.payment_status_id, pst.name as payment_status_name, pst.color as payment_status_color, u.name as created_by_name FROM cash_movements cm LEFT JOIN payment_methods fa ON cm.financial_account_id = fa.id LEFT JOIN purchase_orders po ON cm.purchase_order_id = po.id LEFT JOIN providers prov ON COALESCE(cm.supplier_id, po.provider_id) = prov.id LEFT JOIN payment_statuses pst ON po.payment_status_id = pst.id LEFT JOIN users u ON cm.created_by = u.id WHERE cm.session_id = $1 AND cm.session_type = $2 ORDER BY cm.created_at DESC", [sess.id, 'pagos']);
     sess.movements = mv.rows;
     sess.total_in = mv.rows.filter(m => m.type === 'in').reduce((sum, m) => sum + Number(m.amount), 0);
     sess.total_out = mv.rows.filter(m => m.type === 'out').reduce((sum, m) => sum + Number(m.amount), 0);
@@ -5700,6 +6558,24 @@ app.post('/api/product-attribute-stock/:productId', authenticate, async (req, re
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// endpoint-audit: bulk product attribute stock before generic attr route
+app.put('/api/product-attribute-stock/:productId/bulk', authenticate, async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items)) return res.status(400).json({ error: 'items must be an array' });
+    for (const item of items) {
+      await pool.query(
+        `INSERT INTO product_attributes (product_id, attribute_value_id, stock_quantity)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (product_id, attribute_value_id) DO UPDATE SET stock_quantity = $3`,
+        [req.params.productId, item.attribute_value_id, item.stock_quantity || 0]
+      );
+    }
+    await pool.query('SELECT recalculate_product_stock($1)', [req.params.productId]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.put('/api/product-attribute-stock/:productId/:attributeValueId', authenticate, async (req, res) => {
   try {
     const { stock_quantity, min_stock } = req.body;
@@ -5886,169 +6762,920 @@ app.put('/api/products/:id/attributes/:attributeValueId/stock', authenticate, as
 
 
 // Setup integraciones externas
-app.listen(PORT, () => {
-  console.log(`[req.user.client_id, name, is_active !== false, sort_order || 0, has_delivery === true]🚀 VIB3.ia Backend running on http://localhost:${PORT}`);
-  console.log(`   Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT CONFIGURED'}`);
-});
-// ─── FEATURE 1: Import / Export Productos ──────────────────────────
-app.post("/api/products/import", authenticate, async (req, res) => {
+
+// ═══════════════════════════════════════════════
+// SUBSCRIPTIONS / PLANS / BILLING MODULE
+// ═══════════════════════════════════════════════
+
+// ─── LEADS STATS ─────────────────────────────────────────────
+
+// GET /api/services — list all services
+app.get('/api/services', authenticate, async (req, res) => {
   try {
-    const { rows: existing } = await pool.query(
-      "SELECT id, sku, name FROM products WHERE client_id = $1 AND deleted_at IS NULL",
-      [req.user.client_id]
-    );
-    const skuMap = {};
-    existing.forEach((p) => { skuMap[p.sku] = p; });
-
-    const products = req.body.products || [];
-    if (!products.length) return res.status(400).json({ error: "Sin productos para importar" });
-
-    let created = 0, updated = 0, errors = [];
-    for (const p of products) {
-      try {
-        if (!p.sku) { errors.push({ name: p.name, error: "SKU requerido" }); continue; }
-        const existingProduct = skuMap[p.sku];
-        if (existingProduct) {
-          await pool.query(
-            `UPDATE products SET name = COALESCE($1, name), description = COALESCE($2, description),
-             commercial_description = COALESCE($3, commercial_description),
-             price = CASE WHEN $4 IS NOT NULL THEN $4 ELSE price END,
-             cost_price = CASE WHEN $5 IS NOT NULL THEN $5 ELSE cost_price END,
-             unit = COALESCE($6, unit), stock_quantity = CASE WHEN $7 IS NOT NULL THEN $7 ELSE stock_quantity END,
-             min_stock = CASE WHEN $8 IS NOT NULL THEN $8 ELSE min_stock END,
-             is_active = CASE WHEN $9 IS NOT NULL THEN $9 ELSE is_active END,
-             updated_at = NOW()
-             WHERE id = $10 AND client_id = $11`,
-            [p.name || null, p.description || null, p.commercial_description || null,
-             p.price ?? null, p.cost_price ?? null, p.unit || null,
-             p.stock_quantity ?? null, p.min_stock ?? null,
-             p.is_active !== undefined ? p.is_active : null,
-             existingProduct.id, req.user.client_id]
-          );
-          updated++;
-        } else {
-          const { rows: [cat] } = await pool.query(
-            "SELECT id FROM product_categories WHERE LOWER(name) = LOWER($1) AND client_id = $2 LIMIT 1",
-            [p.category || "General", req.user.client_id]
-          );
-          const { rows: [brand] } = await pool.query(
-            "SELECT id FROM product_brands WHERE LOWER(name) = LOWER($1) AND client_id = $2 LIMIT 1",
-            [p.brand || "Generica", req.user.client_id]
-          );
-          if (!cat) {
-            const { rows: [nc] } = await pool.query(
-              "INSERT INTO product_categories (client_id, name) VALUES ($1, $2) RETURNING id",
-              [req.user.client_id, p.category || "General"]
-            );
-            p.category_id = nc.id;
-          } else p.category_id = cat.id;
-          if (!brand) {
-            const { rows: [nb] } = await pool.query(
-              "INSERT INTO product_brands (client_id, name) VALUES ($1, $2) RETURNING id",
-              [req.user.client_id, p.brand || "Generica"]
-            );
-            p.brand_id = nb.id;
-          } else p.brand_id = brand.id;
-
-          await pool.query(
-            `INSERT INTO products (client_id, sku, sku_externo, name, description, commercial_description,
-             category_id, brand_id, price, cost_price, unit, stock_quantity, min_stock, is_active)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-            [req.user.client_id, p.sku, p.sku_externo || null, p.name, p.description || null,
-             p.commercial_description || null, p.category_id, p.brand_id,
-             p.price || 0, p.cost_price || 0, p.unit || "unidad",
-             p.stock_quantity || 0, p.min_stock || 0, p.is_active !== false]
-          );
-          created++;
-        }
-      } catch (e) { errors.push({ sku: p.sku, name: p.name, error: e.message }); }
+    const { recurring } = req.query;
+    let extra = '';
+    const params = [req.user.client_id];
+    if (recurring === 'false') {
+      extra = ' AND is_recurring = false';
+    } else if (recurring === 'true') {
+      extra = ' AND is_recurring = true';
     }
-    res.json({ created, updated, errors: errors.length, errorDetails: errors });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { rows } = await pool.query(
+      'SELECT id, name, description, price, is_recurring, is_active, sort_order, creates_work_order FROM services WHERE client_id = $1 AND deleted_at IS NULL' + extra + ' ORDER BY sort_order, id',
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching services:', err);
+    res.status(500).json({ error: 'Error al obtener servicios' });
+  }
 });
 
-app.get("/api/products/export", authenticate, async (req, res) => {
+// POST /api/services — create a service
+app.post('/api/services', authenticate, async (req, res) => {
+  try {
+    const { name, description, price, is_recurring, sort_order } = req.body;
+    if (!name || price === undefined) {
+      return res.status(400).json({ error: 'Nombre y precio son requeridos' });
+    }
+    const { rows } = await pool.query(
+      'INSERT INTO services (client_id, name, description, price, is_recurring, sort_order, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [req.user.client_id, name, description || '', price, is_recurring === true, sort_order || 0, req.user.id]
+    );
+
+    // If recurring, auto-create a plan
+    if (is_recurring === true) {
+      await pool.query(
+        'INSERT INTO plans (client_id, service_id, name, description, amount, billing_cycle, sort_order, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING',
+        [req.user.client_id, rows[0].id, name + ' (Recurrente)', description || '', price, 'monthly', sort_order || 0, req.user.id]
+      );
+    }
+
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating service:', err);
+    res.status(500).json({ error: 'Error al crear servicio' });
+  }
+});
+
+// PUT /api/services/:id — update a service
+app.put('/api/services/:id', authenticate, async (req, res) => {
+  try {
+    const { name, description, price, is_recurring, is_active, sort_order, creates_work_order } = req.body;
+    const { rows } = await pool.query(
+      'UPDATE services SET name = COALESCE($1, name), description = COALESCE($2, description), price = COALESCE($3, price), is_recurring = COALESCE($4, is_recurring), is_active = COALESCE($5, is_active), sort_order = COALESCE($6, sort_order), creates_work_order = COALESCE($7, creates_work_order), updated_at = NOW() WHERE id = $8 AND client_id = $9 AND deleted_at IS NULL RETURNING *',
+      [name, description, price, is_recurring, is_active, sort_order, creates_work_order, req.params.id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+    if (rows[0].is_recurring === true) {
+      await pool.query(
+        `INSERT INTO plans (client_id, service_id, name, description, amount, billing_cycle, sort_order)
+         VALUES ($1, $2, $3, $4, $5, 'monthly', $6)
+         ON CONFLICT DO NOTHING`,
+        [req.user.client_id, rows[0].id, rows[0].name, rows[0].description || '', rows[0].price || 0, rows[0].sort_order || 0]
+      );
+      await pool.query(
+        `UPDATE plans SET deleted_at = NULL, name = $1, description = $2, amount = $3, is_active = true, updated_at = NOW()
+         WHERE client_id = $4 AND service_id = $5`,
+        [rows[0].name, rows[0].description || '', rows[0].price || 0, req.user.client_id, rows[0].id]
+      );
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating service:', err);
+    res.status(500).json({ error: 'Error al actualizar servicio' });
+  }
+});
+
+// DELETE /api/services/:id — delete a service
+app.delete('/api/services/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE services SET deleted_at = NOW() WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Servicio no encontrado' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting service:', err);
+    res.status(500).json({ error: 'Error al eliminar servicio' });
+  }
+});
+
+// ═══════════════════════════════════════════════
+// WORK ORDERS (Órdenes de Trabajo)
+// ═══════════════════════════════════════════════
+
+// GET /api/work-orders - list all work orders
+app.get('/api/work-orders', authenticate, async (req, res) => {
+  const { status, contact_id } = req.query;
+  let conditions = 'w.client_id = $1 AND w.deleted_at IS NULL';
+  const params = [req.user.client_id];
+  if (status) {
+    params.push(status);
+    conditions += ' AND w.status = $' + params.length;
+  }
+  if (contact_id) {
+    params.push(contact_id);
+    conditions += ' AND w.contact_id = $' + params.length;
+  }
+  try {
+    const query = 'SELECT w.*, c.name AS contact_name, c.phone AS contact_phone, ' +
+      'u.name AS assigned_name, s.name AS service_name, o.order_number ' +
+      'FROM work_orders w ' +
+      'LEFT JOIN contacts c ON c.id = w.contact_id ' +
+      'LEFT JOIN users u ON u.id = w.assigned_to ' +
+      'LEFT JOIN services s ON s.id = w.service_id ' +
+      'LEFT JOIN orders o ON o.id = w.order_id ' +
+      'WHERE ' + conditions + ' ORDER BY w.created_at DESC';
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching work orders:', err);
+    res.status(500).json({ error: 'Error al obtener ordenes de trabajo' });
+  }
+});
+
+// GET /api/work-orders/:id - single work order
+app.get('/api/work-orders/:id', authenticate, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT p.id, p.sku, p.sku_externo, p.name, p.description, p.commercial_description,
-              p.price, p.cost_price, p.unit, p.stock_quantity, p.min_stock,
-              p.is_active, pc.name as category_name, pb.name as brand_name
-       FROM products p
-       LEFT JOIN product_categories pc ON p.category_id = pc.id
-       LEFT JOIN product_brands pb ON p.brand_id = pb.id
-       WHERE p.client_id = $1 AND p.deleted_at IS NULL
-       ORDER BY p.name`,
+      'SELECT w.*, c.name AS contact_name, c.phone AS contact_phone, ' +
+      'u.name AS assigned_name, s.name AS service_name, o.order_number ' +
+      'FROM work_orders w ' +
+      'LEFT JOIN contacts c ON c.id = w.contact_id ' +
+      'LEFT JOIN users u ON u.id = w.assigned_to ' +
+      'LEFT JOIN services s ON s.id = w.service_id ' +
+      'LEFT JOIN orders o ON o.id = w.order_id ' +
+      'WHERE w.id = $1 AND w.client_id = $2 AND w.deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'OT no encontrada' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching work order:', err);
+    res.status(500).json({ error: 'Error al obtener OT' });
+  }
+});
+
+// POST /api/work-orders - create work order
+app.post('/api/work-orders', authenticate, async (req, res) => {
+  const { contact_id, service_id, title, description, assigned_to, scheduled_date, notes } = req.body;
+  if (!title) {
+    return res.status(400).json({ error: 'Titulo requerido' });
+  }
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO work_orders (client_id, contact_id, service_id, title, description, assigned_to, scheduled_date, notes, created_by) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [req.user.client_id, contact_id || null, service_id || null, title, description || '',
+       assigned_to || null, scheduled_date || null, notes || '', req.user.id]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating work order:', err);
+    res.status(500).json({ error: 'Error al crear OT' });
+  }
+});
+
+// PUT /api/work-orders/:id - update work order (status, assign, etc)
+app.put('/api/work-orders/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { status, assigned_to, scheduled_date, notes, description, title } = req.body;
+  try {
+    let setClauses = ['updated_at = NOW()'];
+    const params = [];
+    let paramIdx = 1;
+
+    if (status !== undefined) {
+      setClauses.push('status = $' + paramIdx++);
+      params.push(status);
+      if (status === 'realizada') {
+        setClauses.push('completed_at = NOW()');
+      }
+    }
+    if (assigned_to !== undefined) { setClauses.push('assigned_to = $' + paramIdx++); params.push(assigned_to); }
+    if (scheduled_date !== undefined) { setClauses.push('scheduled_date = $' + paramIdx++); params.push(scheduled_date); }
+    if (notes !== undefined) { setClauses.push('notes = $' + paramIdx++); params.push(notes); }
+    if (description !== undefined) { setClauses.push('description = $' + paramIdx++); params.push(description); }
+    if (title !== undefined) { setClauses.push('title = $' + paramIdx++); params.push(title); }
+
+    params.push(id, req.user.client_id);
+    const { rows } = await pool.query(
+      'UPDATE work_orders SET ' + setClauses.join(', ') + ' WHERE id = $' + paramIdx++ + ' AND client_id = $' + paramIdx + ' AND deleted_at IS NULL RETURNING *',
+      params
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'OT no encontrada' });
+    if (status !== undefined && rows[0].order_item_id && rows[0].order_id) {
+      const itemStatus = status === 'realizada' ? 'delivered' : 'pending';
+      await pool.query('UPDATE order_items SET fulfillment_status = $1 WHERE id = $2 AND order_id = $3', [itemStatus, rows[0].order_item_id, rows[0].order_id]);
+      await recalculateOrderOperationalStatus(pool, rows[0].order_id, req.user.client_id);
+    }
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating work order:', err);
+    res.status(500).json({ error: 'Error al actualizar OT' });
+  }
+});
+
+// DELETE /api/work-orders/:id - soft delete / cancel
+app.delete('/api/work-orders/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE work_orders SET deleted_at = NOW() WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'OT no encontrada' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting work order:', err);
+    res.status(500).json({ error: 'Error al eliminar OT' });
+  }
+});
+
+
+// ─── LEADS STATS ─────────────────────────────────────────────
+
+// GET /api/plans — list all active plans
+app.get('/api/plans', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT p.id, p.name, p.description, p.billing_cycle, p.amount, p.service_id, p.is_active, p.requires_contract, p.allowed_payment_methods, p.allows_invoice, p.requires_billing_day, p.sort_order, s.name AS service_name FROM plans p LEFT JOIN services s ON s.id = p.service_id WHERE p.client_id = $1 AND p.deleted_at IS NULL ORDER BY p.sort_order, p.id',
       [req.user.client_id]
     );
     res.json(rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (err) {
+    console.error('Error fetching plans:', err);
+    res.status(500).json({ error: 'Error al obtener planes' });
+  }
 });
 
-// ─── FEATURE 2: Reporte Excel (genera JSON para armar Excel en frontend) ──
-app.get("/api/products/report", authenticate, async (req, res) => {
+// POST /api/plans — create a plan
+app.post('/api/plans', authenticate, async (req, res) => {
+  const { service_id, name, description, billing_cycle, amount, requires_contract, allowed_payment_methods, allows_invoice, requires_billing_day, sort_order } = req.body;
+  if (!name || !billing_cycle || !amount) {
+    return res.status(400).json({ error: 'Faltan campos requeridos: name, billing_cycle, amount' });
+  }
   try {
-    const { rows: products } = await pool.query(
-      "SELECT p.id, p.sku, p.sku_externo, p.name, p.description, p.commercial_description, p.price, p.cost_price, p.unit, p.stock_quantity, p.min_stock, p.is_active, p.is_premium, p.premium_level, p.requires_stock, pc.name as category_name, pb.name as brand_name FROM products p LEFT JOIN product_categories pc ON p.category_id = pc.id LEFT JOIN product_brands pb ON p.brand_id = pb.id WHERE p.client_id = $1 AND p.deleted_at IS NULL ORDER BY pc.name, p.name",
-      [req.user.client_id]
+    const { rows } = await pool.query(
+      'INSERT INTO plans (client_id, service_id, name, description, billing_cycle, amount, requires_contract, allowed_payment_methods, allows_invoice, requires_billing_day, sort_order) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *',
+      [req.user.client_id, service_id || null, name, description || '', billing_cycle, amount, requires_contract || false, allowed_payment_methods || '[]', allows_invoice || false, requires_billing_day || false, sort_order || 0]
+    );
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    console.error('Error creating plan:', err);
+    res.status(500).json({ error: 'Error al crear plan' });
+  }
+});
+
+// PUT /api/plans/:id — update a plan
+app.put('/api/plans/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { service_id, name, description, billing_cycle, amount, is_active, requires_contract, allowed_payment_methods, allows_invoice, requires_billing_day, sort_order } = req.body;
+  try {
+    const { rows } = await pool.query(
+      'UPDATE plans SET service_id = COALESCE($1, service_id), name = COALESCE($2, name), description = COALESCE($3, description), billing_cycle = COALESCE($4, billing_cycle), amount = COALESCE($5, amount), is_active = COALESCE($6, is_active), requires_contract = COALESCE($7, requires_contract), allowed_payment_methods = COALESCE($8, allowed_payment_methods), allows_invoice = COALESCE($9, allows_invoice), requires_billing_day = COALESCE($10, requires_billing_day), sort_order = COALESCE($11, sort_order), updated_at = NOW() WHERE id = $12 AND client_id = $13 AND deleted_at IS NULL RETURNING *',
+      [service_id, name, description, billing_cycle, amount, is_active, requires_contract, allowed_payment_methods, allows_invoice, requires_billing_day, sort_order, id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating plan:', err);
+    res.status(500).json({ error: 'Error al actualizar plan' });
+  }
+});
+
+// DELETE /api/plans/:id — soft delete a plan
+app.delete('/api/plans/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE plans SET deleted_at = NOW() WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Plan no encontrado' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting plan:', err);
+    res.status(500).json({ error: 'Error al eliminar plan' });
+  }
+});
+
+// ─── LEADS STATS ─────────────────────────────────────────────
+
+// GET /api/subscriptions — list all active subscriptions (with contact & plan info)
+app.get('/api/subscriptions', authenticate, async (req, res) => {
+  const { status, contact_id } = req.query;
+  let conditions = 's.client_id = $1 AND s.deleted_at IS NULL';
+  const params = [req.user.client_id];
+  if (status) {
+    params.push(status);
+    conditions += ' AND s.status = $' + params.length;
+  }
+  if (contact_id) {
+    params.push(contact_id);
+    conditions += ' AND s.contact_id = $' + params.length;
+  }
+  try {
+    const query = 'SELECT s.*, c.name AS contact_name, c.phone AS contact_phone, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount FROM subscriptions s JOIN contacts c ON c.id = s.contact_id JOIN plans p ON p.id = s.plan_id WHERE ' + conditions + ' ORDER BY s.next_billing_date ASC';
+    const { rows } = await pool.query(query, params);
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching subscriptions:', err);
+    res.status(500).json({ error: 'Error al obtener suscripciones' });
+  }
+});
+
+// GET /api/subscriptions/:id — single subscription detail
+app.get('/api/subscriptions/:id', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT s.*, c.name AS contact_name, c.phone AS contact_phone, p.name AS plan_name, p.billing_cycle, p.amount AS plan_amount FROM subscriptions s JOIN contacts c ON c.id = s.contact_id JOIN plans p ON p.id = s.plan_id WHERE s.id = $1 AND s.client_id = $2 AND s.deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error fetching subscription:', err);
+    res.status(500).json({ error: 'Error al obtener suscripción' });
+  }
+});
+
+// POST /api/subscriptions — create a subscription (also generates first billing cycle)
+app.post('/api/subscriptions', authenticate, async (req, res) => {
+  const { contact_id, plan_id, start_date, billing_amount, default_payment_method_id, notes } = req.body;
+  if (!contact_id || !plan_id) {
+    return res.status(400).json({ error: 'Faltan campos: contact_id, plan_id' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Verify plan exists
+    const { rows: planRows } = await client.query(
+      'SELECT id, name, billing_cycle, amount FROM plans WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL AND is_active = true',
+      [plan_id, req.user.client_id]
+    );
+    if (planRows.length === 0) throw { status: 404, message: 'Plan no encontrado' };
+
+    const plan = planRows[0];
+    const start = start_date ? new Date(start_date) : new Date();
+    const amount = billing_amount || plan.amount;
+
+    // Calculate next billing date based on cycle
+    const nextBilling = new Date(start);
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+    const daysToAdd = cycleMap[plan.billing_cycle] || 30;
+    nextBilling.setDate(nextBilling.getDate() + daysToAdd);
+    const nextBillingStr = nextBilling.toISOString().split('T')[0];
+
+    // Create subscription
+    const { rows: subRows } = await client.query(
+      'INSERT INTO subscriptions (client_id, contact_id, plan_id, start_date, next_billing_date, billing_amount, default_payment_method_id, notes, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [req.user.client_id, contact_id, plan_id, start.toISOString().split('T')[0], nextBillingStr, amount, default_payment_method_id || null, notes || null, req.user.id]
     );
 
-    const ids = products.map(p => p.id);
-    const attrGroups = {};
-    if (ids.length) {
-      const { rows: attrs } = await pool.query(
-        "SELECT pa.product_id, av.id as value_id, av.value, at.name as attr_name FROM product_attributes pa JOIN attribute_values av ON pa.attribute_value_id = av.id JOIN attribute_types at ON av.attribute_type_id = at.id WHERE pa.product_id = ANY($1::int[]) ORDER BY at.name, av.value",
-        [ids]
-      );
-      attrs.forEach(a => {
-        if (!attrGroups[a.product_id]) attrGroups[a.product_id] = {};
-        if (!attrGroups[a.product_id][a.attr_name]) attrGroups[a.product_id][a.attr_name] = [];
-        attrGroups[a.product_id][a.attr_name].push(a.value);
-      });
-    }
+    // Generate first billing cycle
+    const periodEnd = new Date(start);
+    periodEnd.setDate(periodEnd.getDate() + daysToAdd);
+    const { rows: bcRows } = await client.query(
+      'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.client_id, subRows[0].id, start.toISOString().split('T')[0], periodEnd.toISOString().split('T')[0], amount, nextBillingStr]
+    );
 
-    // Expand: flat rows, one per attribute combination
-    function expandRow(p) {
-      const groups = attrGroups[p.id];
-      if (!groups || Object.keys(groups).length === 0) {
-        return [{ ...p, talle: "", color: "", attr_combo: "Sin atributos" }];
-      }
+    // Create invoice item for this cycle
+    await client.query(
+      'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [req.user.client_id, bcRows[0].id, 'Cuota ' + plan.name, amount, 'subscription', 1, amount]
+    );
 
-      // Cartesian product of all attribute groups
-      const keys = Object.keys(groups);
-      const values = keys.map(k => groups[k]);
-      function cartesian(arrays) {
-        if (arrays.length === 0) return [[]];
-        const [first, ...rest] = arrays;
-        const restResult = cartesian(rest);
-        const result = [];
-        for (const f of first) {
-          for (const r of restResult) {
-            result.push([f, ...r]);
-          }
-        }
-        return result;
-      }
-
-      const combinations = cartesian(values);
-      return combinations.map(combo => {
-        const row = { ...p };
-        keys.forEach((k, i) => {
-          row[k.toLowerCase()] = combo[i];
-        });
-        row.attr_combo = keys.map((k, i) => k + ": " + combo[i]).join(", ");
-        return row;
-      });
-    }
-
-    const report = [];
-    products.forEach(p => {
-      expandRow(p).forEach(r => report.push(r));
+    await client.query('COMMIT');
+    res.status(201).json({
+      subscription: subRows[0],
+      billing_cycle: bcRows[0]
     });
-
-    res.json(report);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error creating subscription:', err);
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Error al crear suscripción' });
+  } finally {
+    client.release();
+  }
 });
-// ── Plugins ──
+
+// PUT /api/subscriptions/:id — update subscription
+app.put('/api/subscriptions/:id', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const { plan_id, status, billing_amount, default_payment_method_id, notes } = req.body;
+  try {
+    const { rows } = await pool.query(
+      'UPDATE subscriptions SET plan_id = COALESCE($1, plan_id), status = COALESCE($2, status), billing_amount = COALESCE($3, billing_amount), default_payment_method_id = COALESCE($4, default_payment_method_id), notes = COALESCE($5, notes), updated_at = NOW() WHERE id = $6 AND client_id = $7 AND deleted_at IS NULL RETURNING *',
+      [plan_id, status, billing_amount, default_payment_method_id, notes, id, req.user.client_id]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json(rows[0]);
+  } catch (err) {
+    console.error('Error updating subscription:', err);
+    res.status(500).json({ error: 'Error al actualizar suscripción' });
+  }
+});
+
+// DELETE /api/subscriptions/:id — soft delete / cancel
+app.delete('/api/subscriptions/:id', authenticate, async (req, res) => {
+  try {
+    const { rowCount } = await pool.query(
+      'UPDATE subscriptions SET deleted_at = NOW(), status = $1 WHERE id = $2 AND client_id = $3 AND deleted_at IS NULL',
+      ['cancelled', req.params.id, req.user.client_id]
+    );
+    if (rowCount === 0) return res.status(404).json({ error: 'Suscripción no encontrada' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting subscription:', err);
+    res.status(500).json({ error: 'Error al cancelar suscripción' });
+  }
+});
+
+// ─── LEADS STATS ─────────────────────────────────────────────
+
+
+// GET /api/billing-cycles — list billing cycles with subscription/contact/plan context
+app.get('/api/billing-cycles', authenticate, async (req, res) => {
+  const { status, subscription_id, limit } = req.query;
+  const params = [req.user.client_id];
+  let conditions = 'bc.client_id = $1 AND bc.deleted_at IS NULL';
+  if (status) { params.push(status); conditions += ' AND bc.status = $' + params.length; }
+  if (subscription_id) { params.push(subscription_id); conditions += ' AND bc.subscription_id = $' + params.length; }
+  params.push(Number(limit) || 200);
+  try {
+    const { rows } = await pool.query(
+      `SELECT bc.*, s.contact_id, s.status AS subscription_status, c.name AS contact_name, c.phone AS contact_phone,
+              p.name AS plan_name, p.billing_cycle, p.service_id, sv.name AS service_name,
+              o.order_number, o.total AS order_total,
+              CASE
+                WHEN bc.order_id IS NULL THEN 'pending'
+                WHEN EXISTS (SELECT 1 FROM order_payments op WHERE op.order_id = bc.order_id AND op.deleted_at IS NULL) THEN 'paid'
+                ELSE 'billed'
+              END AS status,
+              (SELECT COALESCE(JSON_AGG(json_build_object('id', ii.id, 'description', ii.description, 'amount', ii.amount, 'type', ii.type, 'quantity', ii.quantity, 'unit_price', ii.unit_price) ORDER BY ii.id), '[]'::json)
+               FROM invoice_items ii WHERE ii.billing_cycle_id = bc.id) AS items
+       FROM billing_cycles bc
+       LEFT JOIN orders o ON o.id = bc.order_id
+       JOIN subscriptions s ON s.id = bc.subscription_id
+       JOIN contacts c ON c.id = s.contact_id
+       JOIN plans p ON p.id = s.plan_id
+       LEFT JOIN services sv ON sv.id = p.service_id
+       WHERE ${conditions}
+       ORDER BY bc.due_date ASC NULLS LAST, bc.id DESC
+       LIMIT $${params.length}`,
+      params
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching billing cycles:', err);
+    res.status(500).json({ error: 'Error al obtener ciclos de facturación' });
+  }
+});
+
+// GET /api/subscriptions/:id/billing-cycles — billing cycles for a subscription
+app.get('/api/subscriptions/:id/billing-cycles', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT bc.*, o.order_number, o.total AS order_total, CASE WHEN bc.order_id IS NULL THEN \'pending\' WHEN EXISTS (SELECT 1 FROM order_payments op WHERE op.order_id = bc.order_id AND op.deleted_at IS NULL) THEN \'paid\' ELSE \'billed\' END AS status, (SELECT COALESCE(JSON_AGG(json_build_object(\'id\', ii.id, \'description\', ii.description, \'amount\', ii.amount, \'type\', ii.type, \'quantity\', ii.quantity, \'unit_price\', ii.unit_price) ORDER BY ii.id), \'[]\'::json) FROM invoice_items ii WHERE ii.billing_cycle_id = bc.id) AS items FROM billing_cycles bc LEFT JOIN orders o ON o.id = bc.order_id WHERE bc.subscription_id = $1 AND bc.client_id = $2 AND bc.deleted_at IS NULL ORDER BY bc.period_start DESC',
+      [req.params.id, req.user.client_id]
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching billing cycles:', err);
+    res.status(500).json({ error: 'Error al obtener ciclos de facturación' });
+  }
+});
+
+// GET /api/billing/overview — subscription/overview KPI summary
+app.get('/api/billing/overview', authenticate, async (req, res) => {
+  try {
+    const { rows: active_subscriptions } = await pool.query(
+      "SELECT COUNT(*)::int FROM subscriptions WHERE client_id = $1 AND deleted_at IS NULL AND status != 'cancelled'",
+      [req.user.client_id]
+    );
+    const { rows: overdue } = await pool.query(
+      "SELECT COUNT(*)::int AS overdue_cycles, COALESCE(SUM(amount), 0) AS overdue_total FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date < CURRENT_DATE AND bc.order_id IS NULL",
+      [req.user.client_id]
+    );
+    const { rows: upcoming } = await pool.query(
+      "SELECT COUNT(*)::int AS upcoming_cycles, COALESCE(SUM(amount), 0) AS upcoming_total FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date >= CURRENT_DATE AND bc.due_date <= CURRENT_DATE + 30 AND bc.order_id IS NULL",
+      [req.user.client_id]
+    );
+    const { rows: revenue } = await pool.query(
+      "SELECT COALESCE(SUM(amount), 0) AS monthly_revenue FROM billing_cycles bc WHERE bc.client_id = $1 AND bc.deleted_at IS NULL AND bc.due_date >= DATE_TRUNC('month', CURRENT_DATE) AND bc.due_date <= (DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month - 1 day')::date AND bc.order_id IS NULL",
+      [req.user.client_id]
+    );
+    res.json({
+      active_subscriptions: active_subscriptions[0].count,
+      overdue_cycles: overdue[0].overdue_cycles,
+      overdue_total: parseFloat(overdue[0].overdue_total),
+      upcoming_cycles: upcoming[0].upcoming_cycles,
+      upcoming_total: parseFloat(upcoming[0].upcoming_total),
+      monthly_revenue: parseFloat(revenue[0].monthly_revenue)
+    });
+  } catch (err) {
+    console.error('Error en billing overview:', err);
+    res.json({ active_subscriptions: 0, overdue_cycles: 0, overdue_total: 0, upcoming_cycles: 0, upcoming_total: 0, monthly_revenue: 0 });
+  }
+});
+
+// POST /api/subscriptions/batch-generate-cycles — generate ONE cycle per active sub (current/overdue only, no future)
+app.post('/api/subscriptions/batch-generate-cycles', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { rows: subs } = await client.query(
+      "SELECT s.id, s.plan_id, s.billing_amount, s.start_date, s.contact_id FROM subscriptions s WHERE s.client_id = $1 AND s.deleted_at IS NULL AND s.status != 'cancelled' ORDER BY s.id",
+      [req.user.client_id]
+    );
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+
+    let generated = 0;
+    let skipped = 0;
+
+    for (const sub of subs) {
+      const { rows: planRows } = await client.query('SELECT billing_cycle, name FROM plans WHERE id = $1', [sub.plan_id]);
+      const days = cycleMap[planRows[0]?.billing_cycle] || 30;
+      const planName = planRows[0]?.name || '';
+
+      // Get the last period_end
+      const { rows: maxRow } = await client.query(
+        'SELECT MAX(period_end) AS last_end FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL',
+        [sub.id]
+      );
+      const cursor = maxRow[0]?.last_end ? new Date(maxRow[0].last_end) : new Date(sub.start_date);
+
+      // Calculate the next period
+      const nextStart = new Date(cursor);
+      nextStart.setDate(nextStart.getDate() + 1);
+      const ns = nextStart.toISOString().split('T')[0];
+      const nextEnd = new Date(nextStart);
+      nextEnd.setDate(nextEnd.getDate() + days);
+      const ne = nextEnd.toISOString().split('T')[0];
+
+      // Skip if this cycle already exists
+      const { rows: dup } = await client.query(
+        'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
+        [sub.id, ns]
+      );
+      if (dup.length > 0) { skipped++; continue; }
+
+      // Skip if this is a future period (beyond today)
+      if (new Date(ns) > new Date()) { skipped++; continue; }
+
+      // Create the cycle
+      await client.query('BEGIN');
+      const { rows: newBC } = await client.query(
+        'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [req.user.client_id, sub.id, ns, ne, sub.billing_amount, new Date(nextEnd.getTime() + 86400000).toISOString().split('T')[0]]
+      );
+      await client.query(
+        'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+        [req.user.client_id, newBC[0].id, 'Cuota ' + planName, sub.billing_amount, 'subscription', 1, sub.billing_amount]
+      );
+      await client.query(
+        "UPDATE subscriptions SET next_billing_date = $1, updated_at = NOW() WHERE id = $2",
+        [new Date(nextEnd.getTime() + 86400000).toISOString().split('T')[0], sub.id]
+      );
+      await client.query('COMMIT');
+      generated++;
+    }
+
+    res.json({ generated, skipped });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error batch generating cycles:', err);
+    res.status(500).json({ error: 'Error al generar ciclos' });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/subscriptions/:id/generate-cycle — manually generate next billing cycle
+app.post('/api/subscriptions/:id/generate-cycle', authenticate, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: subRows } = await client.query(
+      'SELECT * FROM subscriptions WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL',
+      [req.params.id, req.user.client_id]
+    );
+    if (subRows.length === 0) throw { status: 404, message: 'Suscripción no encontrada' };
+    const sub = subRows[0];
+
+        // Get last billing cycle period_end, walking past any existing periods
+    const cycleMap = { weekly: 7, biweekly: 14, monthly: 30, quarterly: 90, semiannual: 180, annual: 365 };
+    const { rows: planRows } = await client.query('SELECT billing_cycle, name FROM plans WHERE id = $1', [sub.plan_id]);
+    const days = cycleMap[planRows[0]?.billing_cycle] || 30;
+    const planName = planRows[0]?.name || '';
+
+    // Determine cursor: MAX(period_end) or start_date if no cycles exist
+    const { rows: maxRow } = await client.query(
+      'SELECT MAX(period_end) AS last_end FROM billing_cycles WHERE subscription_id = $1 AND deleted_at IS NULL',
+      [sub.id]
+    );
+    let cursor = maxRow[0]?.last_end ? new Date(maxRow[0].last_end) : new Date(sub.start_date);
+
+    // Calculate the upcoming period
+    const nextPeriodStart = new Date(cursor);
+    nextPeriodStart.setDate(nextPeriodStart.getDate() + 1);
+    const nextPs = nextPeriodStart.toISOString().split('T')[0];
+    const nextPeriodEnd = new Date(nextPeriodStart);
+    nextPeriodEnd.setDate(nextPeriodEnd.getDate() + days);
+    const nextPe = nextPeriodEnd.toISOString().split('T')[0];
+
+    // Check if the immediate next period already exists
+    const { rows: existing } = await client.query(
+      'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
+      [sub.id, nextPs]
+    );
+    if (existing.length > 0) {
+      // User must confirm they want to skip forward
+      const { skip } = req.body;
+      if (!skip) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'already_exists',
+          message: 'El ciclo ' + nextPs + ' a ' + nextPe + ' ya existe.',
+          next_period_start: nextPs,
+          next_period_end: nextPe
+        });
+      }
+      // Walk forward past all existing cycles to find a gap
+      let tempDate = nextPeriodEnd;
+      for (let i = 0; i < 12; i++) {
+        const testStart = new Date(tempDate);
+        testStart.setDate(testStart.getDate() + 1);
+        const ts = testStart.toISOString().split('T')[0];
+        const { rows: dup } = await client.query(
+          'SELECT 1 FROM billing_cycles WHERE subscription_id = $1 AND period_start = $2 AND deleted_at IS NULL',
+          [sub.id, ts]
+        );
+        if (dup.length === 0) {
+          cursor = tempDate;
+          break;
+        }
+        tempDate.setDate(tempDate.getDate() + days);
+        if (i === 11) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Ya existen 12+ periodos hacia adelante.' });
+        }
+      }
+    }
+
+    // Found a gap — create the cycle
+    const periodStart = new Date(cursor);
+    periodStart.setDate(periodStart.getDate() + 1);
+    const ps = periodStart.toISOString().split('T')[0];
+    const periodEnd = new Date(periodStart);
+    periodEnd.setDate(periodEnd.getDate() + days);
+
+    const { rows: newBC } = await client.query(
+      'INSERT INTO billing_cycles (client_id, subscription_id, period_start, period_end, amount, due_date) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.client_id, sub.id, ps, periodEnd.toISOString().split('T')[0], sub.billing_amount, new Date(periodEnd.getTime() + 86400000).toISOString().split('T')[0]]
+    );
+
+    await client.query(
+      'INSERT INTO invoice_items (client_id, billing_cycle_id, description, amount, type, quantity, unit_price) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+      [req.user.client_id, newBC[0].id, 'Cuota ' + planName, sub.billing_amount, 'subscription', 1, sub.billing_amount]
+    );
+
+    await client.query(
+      'UPDATE subscriptions SET next_billing_date = $1, updated_at = NOW() WHERE id = $2',
+      [new Date(periodEnd.getTime() + 86400000).toISOString().split('T')[0], sub.id]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json(newBC[0]);
+
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error generating cycle:', err);
+    if (err.status) return res.status(err.status).json({ error: err.message });
+    res.status(500).json({ error: 'Error al generar ciclo' });
+  } finally {
+    client.release();
+  }
+});
+
+
+// POST /api/billing/cycles/:cycleId/accrue — devengar un billing cycle específico
+app.post('/api/billing/cycles/:cycleId/accrue', authenticate, async (req, res) => {
+  const cycleId = parseInt(req.params.cycleId);
+  if (!cycleId) return res.status(400).json({ error: 'cycleId requerido' });
+  await devengarSingleBC(req, res, cycleId);
+});
+
+// POST /api/subscriptions/batch-accrue — devengar todos los BC pendientes
+app.post('/api/subscriptions/batch-accrue', authenticate, async (req, res) => {
+  await devengarBCs(req, res, null, null);
+});
+
+// POST /api/billing/contacts/:contactId/accrue — devengar BC pendientes de un cliente
+app.post('/api/billing/contacts/:contactId/accrue', authenticate, async (req, res) => {
+  const contactId = parseInt(req.params.contactId);
+  if (!contactId) return res.status(400).json({ error: 'contactId requerido' });
+  await devengarBCs(req, res, null, contactId);
+});
+
+// POST /api/billing/subscriptions/:subscriptionId/accrue — devengar BC pendientes de una suscripción
+app.post('/api/billing/subscriptions/:subscriptionId/accrue', authenticate, async (req, res) => {
+  const subId = parseInt(req.params.subscriptionId);
+  if (!subId) return res.status(400).json({ error: 'subscriptionId requerido' });
+  await devengarBCs(req, res, subId, null);
+});
+
+// Core function: devengar billing cycles
+async function devengarBCs(req, res, subscription_id, contact_id) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    let conditions = 'bc.client_id = $1 AND bc.deleted_at IS NULL';
+    const params = [req.user.client_id];
+    let pIdx = 2;
+
+    conditions += " AND (bc.status IS NULL OR bc.status = 'pending') AND bc.order_id IS NULL";
+
+    if (subscription_id) {
+      params.push(subscription_id);
+      conditions += ' AND bc.subscription_id = $' + pIdx++;
+    } else if (contact_id) {
+      params.push(contact_id);
+      conditions += ' AND s.contact_id = $' + pIdx++;
+    }
+
+    params.push(200);
+    const { rows: cycles } = await client.query(
+      `SELECT bc.*, s.contact_id, s.plan_id, s.billing_amount, p.name AS plan_name, p.service_id
+       FROM billing_cycles bc
+       JOIN subscriptions s ON s.id = bc.subscription_id AND s.status = 'active' AND s.deleted_at IS NULL
+       JOIN plans p ON p.id = s.plan_id
+       WHERE ${conditions}
+       ORDER BY bc.due_date ASC
+       LIMIT $${pIdx}`,
+      params
+    );
+
+    if (cycles.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json({ accrued: 0, message: 'No hay billing cycles pendientes para devengar', results: [] });
+    }
+
+    const results = [];
+
+    for (const bc of cycles) {
+      const amount = Number(bc.amount || bc.billing_amount || 0);
+      if (amount <= 0) {
+        results.push({ billing_cycle_id: bc.id, message: 'Monto inválido', accrued: false });
+        continue;
+      }
+
+      const planLabel = bc.plan_name || 'Suscripción';
+      const periodLabel = new Date(bc.period_start).toLocaleDateString('es-AR') + ' → ' + new Date(bc.period_end).toLocaleDateString('es-AR');
+      const orderNotes = planLabel + ' · ' + periodLabel;
+
+      const { rows: orderRows } = await client.query(
+        `INSERT INTO orders (client_id, contact_id, order_type, order_status_id, notes)
+         VALUES ($1, $2, 'NV', 3, $3) RETURNING *`,
+        [req.user.client_id, bc.contact_id, orderNotes]
+      );
+      const order = orderRows[0];
+
+      const orderNumber = await getNextOrderNumber(client, req.user.client_id);
+      await client.query('UPDATE orders SET order_number = $1 WHERE id = $2', [orderNumber, order.id]);
+
+      let serviceId = bc.service_id || null;
+
+      const { rows: itemRows } = await client.query(
+        `INSERT INTO order_items (order_id, product_id, service_id, is_service, quantity, unit_price, subtotal, fulfillment_status)
+         VALUES ($1, NULL, $2, true, 1, $3, $3, 'delivered') RETURNING *`,
+        [order.id, serviceId, amount]
+      );
+
+      await client.query("UPDATE orders SET total = $1, updated_at = NOW() WHERE id = $2", [amount, order.id]);
+
+      await client.query(
+        "UPDATE billing_cycles SET status = 'billed', order_id = $1, order_item_id = $2, updated_at = NOW() WHERE id = $3",
+        [order.id, itemRows[0].id, bc.id]
+      );
+
+      await client.query('UPDATE subscriptions SET updated_at = NOW() WHERE id = $1', [bc.subscription_id]);
+
+      results.push({
+        billing_cycle_id: bc.id,
+        subscription_id: bc.subscription_id,
+        order_id: order.id,
+        order_number: orderNumber,
+        amount: amount,
+        contact_id: bc.contact_id,
+        accrued: true
+      });
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      accrued: results.filter(r => r.accrued).length,
+      skipped: results.filter(r => !r.accrued).length,
+      results
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error al devengar:', err);
+    res.status(500).json({ error: 'Error al devengar: ' + err.message });
+  } finally {
+    client.release();
+  }
+}
+
+// Core function: devengar un billing cycle individual (por ID)
+async function devengarSingleBC(req, res, cycleId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: cycles } = await client.query(
+      `SELECT bc.*, s.contact_id, s.plan_id, s.billing_amount, p.name AS plan_name, p.service_id
+       FROM billing_cycles bc
+       JOIN subscriptions s ON s.id = bc.subscription_id AND s.status = 'active' AND s.deleted_at IS NULL
+       JOIN plans p ON p.id = s.plan_id
+       WHERE bc.id = $1 AND bc.client_id = $2 AND bc.deleted_at IS NULL
+       AND (bc.status IS NULL OR bc.status = 'pending') AND bc.order_id IS NULL
+       LIMIT 1`,
+      [cycleId, req.user.client_id]
+    );
+
+    if (cycles.length === 0) {
+      await client.query('ROLLBACK');
+      return res.json({ accrued: 0, message: 'Billing cycle no encontrado o ya devengado', results: [] });
+    }
+
+    const bc = cycles[0];
+    const amount = Number(bc.amount || bc.billing_amount || 0);
+    if (amount <= 0) {
+      await client.query('ROLLBACK');
+      return res.json({ accrued: 0, message: 'Monto inválido', results: [] });
+    }
+
+    const planLabel = bc.plan_name || 'Suscripción';
+    const periodLabel = new Date(bc.period_start).toLocaleDateString('es-AR') + ' → ' + new Date(bc.period_end).toLocaleDateString('es-AR');
+    const orderNotes = planLabel + ' · ' + periodLabel;
+
+    const { rows: orderRows } = await client.query(
+      `INSERT INTO orders (client_id, contact_id, order_type, order_status_id, notes)
+       VALUES ($1, $2, 'NV', 3, $3) RETURNING *`,
+      [req.user.client_id, bc.contact_id, orderNotes]
+    );
+    const order = orderRows[0];
+
+    const orderNumber = await getNextOrderNumber(client, req.user.client_id);
+    await client.query('UPDATE orders SET order_number = $1 WHERE id = $2', [orderNumber, order.id]);
+
+    let serviceId = bc.service_id || null;
+
+    const { rows: itemRows } = await client.query(
+      `INSERT INTO order_items (order_id, product_id, service_id, is_service, quantity, unit_price, subtotal, fulfillment_status)
+       VALUES ($1, NULL, $2, true, 1, $3, $3, 'delivered') RETURNING *`,
+      [order.id, serviceId, amount]
+    );
+
+    await client.query("UPDATE orders SET total = $1, updated_at = NOW() WHERE id = $2", [amount, order.id]);
+
+    await client.query(
+      "UPDATE billing_cycles SET status = 'billed', order_id = $1, order_item_id = $2, updated_at = NOW() WHERE id = $3",
+      [order.id, itemRows[0].id, bc.id]
+    );
+
+    await client.query('UPDATE subscriptions SET updated_at = NOW() WHERE id = $1', [bc.subscription_id]);
+
+    await client.query('COMMIT');
+    res.json({
+      accrued: 1,
+      skipped: 0,
+      results: [{
+        billing_cycle_id: bc.id,
+        subscription_id: bc.subscription_id,
+        order_id: order.id,
+        order_number: orderNumber,
+        amount: amount,
+        contact_id: bc.contact_id,
+        accrued: true
+      }]
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Error al devengar BC individual:', err);
+    res.status(500).json({ error: 'Error al devengar: ' + err.message });
+  } finally {
+    client.release();
+  }
+}
+
+// ─── LEADS STATS ─────────────────────────────────────────────
 try {
   require('./integrations')(app, pool, authenticate);
   console.log('Modulo integraciones cargado');
@@ -6069,3 +7696,129 @@ try {
 } catch (e) {
   if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando plugin:', e.message);
 }
+try {
+  require('./plugins/budgets')(app, pool, authenticate);
+  console.log('Plugin budgets cargado');
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error('Error cargando budgets:', e.message);
+}
+try {
+  require("./simulator")(app, pool, authenticate);
+  console.log("Modulo simulador cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando simulador:", e.message);
+}
+try {
+  require("./afip/afip")(app, pool, authenticate);
+  console.log("Modulo AFIP cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando AFIP:", e.message);
+}
+
+try {
+  require('./plugins/facturacion')(app, pool, authenticate);
+  console.log('Plugin facturacion cargado');
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') console.error('Error cargando facturacion:', e.message);
+}
+
+try {
+  require('./plugins/mailing')(app, pool, authenticate);
+
+try {
+  require("./plugins/openwa")(app, pool, authenticate);
+  console.log("Plugin openwa cargado");
+} catch (e) {
+  if (e.code !== "MODULE_NOT_FOUND") console.error("Error cargando openwa:", e.message);
+}
+  console.log('Plugin mailing cargado');
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') console.error('Error cargando mailing:', e.message);
+}
+
+
+try {
+  const { setupNotificationRoutes } = require('./plugins/notifications');
+  setupNotificationRoutes(app, pool, authenticate);
+  console.log('Plugin notifications cargado');
+} catch (e) {
+  if (e.code !== 'MODULE_NOT_FOUND') console.error('Error cargando notifications:', e.message);
+}
+
+// Auto-expire budgets on startup and every hour
+setTimeout(async () => {
+  try {
+    await pool.query("UPDATE budgets SET status = 'vencido', updated_at = NOW() WHERE status = 'pendiente' AND valid_until IS NOT NULL AND valid_until < CURRENT_DATE");
+    console.log('Budgets auto-expire check done');
+  } catch (e) { console.warn('auto-expire budgets on startup skipped:', e.message); }
+}, 5000);
+
+setInterval(async () => {
+  try {
+    await pool.query("UPDATE budgets SET status = 'vencido', updated_at = NOW() WHERE status = 'pendiente' AND valid_until IS NOT NULL AND valid_until < CURRENT_DATE");
+  } catch (e) { console.warn('auto-expire budgets:', e.message); }
+}, 3600000);
+
+// AGENT KNOWLEDGE
+app.get('/api/agent/knowledge', authenticate, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, category, content, confidence, source, created_at, updated_at FROM agent_knowledge WHERE client_id = $1 AND is_active = true ORDER BY category, confidence DESC',
+      [req.user.client_id]
+    );
+    res.json({ knowledge: rows });
+  } catch (err) {
+    console.error('Error GET agent_knowledge:', err);
+    res.status(500).json({ error: 'Error al obtener conocimiento del agente' });
+  }
+});
+
+app.post('/api/agent/knowledge', authenticate, async (req, res) => {
+  try {
+    const { action, category, content, confidence, source } = req.body;
+    if (!action || !category || !content) {
+      return res.status(400).json({ error: 'action, category y content son requeridos' });
+    }
+    if (action === 'add') {
+      const { rows } = await pool.query(
+        'INSERT INTO agent_knowledge (client_id, category, content, confidence, source) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [req.user.client_id, category, content, confidence || 0.5, source || 'inferred']
+      );
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'update') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET content = $1, confidence = $2, source = $3, updated_at = NOW() WHERE client_id = $4 AND category = $5 AND is_active = true RETURNING *',
+        [content, confidence || 0.5, source || 'correction', req.user.client_id, category]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro conocimiento activo para esa categoria' });
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'verify') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET confidence = LEAST(confidence + 0.1, 1.0), updated_at = NOW() WHERE client_id = $1 AND category = $2 AND content = $3 AND is_active = true RETURNING *',
+        [req.user.client_id, category, content]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro el conocimiento especificado' });
+      return res.json({ knowledge: rows[0] });
+    }
+    if (action === 'deactivate') {
+      const { rows } = await pool.query(
+        'UPDATE agent_knowledge SET is_active = false, updated_at = NOW() WHERE client_id = $1 AND category = $2 AND content = $3 AND is_active = true RETURNING *',
+        [req.user.client_id, category, content]
+      );
+      if (rows.length === 0) return res.status(404).json({ error: 'No se encontro el conocimiento especificado' });
+      return res.json({ knowledge: rows[0] });
+    }
+    return res.status(400).json({ error: 'Accion no valida. Usar: add, update, verify, deactivate' });
+  } catch (err) {
+    console.error('Error POST agent_knowledge:', err);
+    res.status(500).json({ error: 'Error al guardar conocimiento del agente' });
+  }
+});
+
+
+app.listen(PORT, () => {
+  console.log(`🚀 VIB3.ia Backend running on http://localhost:${PORT}`);
+  console.log(`   Database: ${process.env.DATABASE_URL ? 'configured' : 'NOT CONFIGURED'}`);
+});

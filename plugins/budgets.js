@@ -77,7 +77,8 @@ module.exports = function(app, pool, authenticate) {
     const client = await pool.connect();
     try {
       const clientId = req.user.client_id;
-      const { client_id: contact_id, items = [], notes, valid_until, discount = 0 } = req.body;
+      const { contact_id: _contact_id, client_id, items = [], notes, valid_until, discount = 0 } = req.body;
+      const contact_id = _contact_id || client_id;
 
       if (!contact_id) return res.status(400).json({ error: 'contact_id requerido' });
       if (!items.length) return res.status(400).json({ error: 'Se requiere al menos un item' });

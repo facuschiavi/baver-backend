@@ -1753,8 +1753,8 @@ app.put('/api/orders/:id', authenticate, async (req, res) => {
 
       let newPayStatusId = null;
       if (paid >= recalcTotal) {
-        const pagado = statuses.find(s => s.name === 'Pagado');
-        newPayStatusId = pagado?.id || statuses[statuses.length - 1]?.id;
+        constpagado = statuses.find(s => s.name === 'Pagado');
+        newPayStatusId =pagado?.id || statuses[statuses.length - 1]?.id;
       } else if (paid > 0) {
         const parcial = statuses.find(s => s.name === 'Pagado parcial');
         newPayStatusId = parcial?.id || statuses[1]?.id;
